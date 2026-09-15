@@ -85,11 +85,17 @@ there is.
 ## Status
 
 Built and tested: the logic that decides, the record it decides against, the
-adapters to real nodes, the loop that drives a swap to completion, and the
-quote surface that creates one. Not built: the payout adapter, and the daemon
-that wires these together behind a configuration file.
+adapters to real nodes, the loop that drives a swap to completion, the quote
+surface that creates one, and the pricing that decides what it costs.
 
-Nothing has been run against a live node yet.
+**A swap has run end to end across two chains.** `bridgetest` drives the whole
+stack against the lab's four nodes — a user on the BLAKE2b chain paying a
+Bitcoin invoice, with real hold invoices, real HTLCs and a real journal on
+disk. Both halves are covered: the settlement, and the refund when the outgoing
+leg cannot be delivered.
+
+Not built: the payout adapter, and the daemon that wires this behind a
+configuration file. Nothing has run against mainnet.
 
 Nothing here has moved money. The order was deliberate: the parts that lose
 funds when they are wrong are the parts that can be tested exhaustively
