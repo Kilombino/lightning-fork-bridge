@@ -143,3 +143,41 @@ type Store interface {
 	// Close releases the store.
 	Close() error
 }
+
+// Committed is the outgoing amount the bridge may still have to pay across
+// every swap that has not finished.
+//
+// It is what makes a balance into headroom. The node's outgoing balance says
+// what could be sent right now; it says nothing about the swaps already
+// quoted, offered or funded that will want to be paid out of that same
+// balance. Quoting against the raw balance therefore sells the same money
+// repeatedly, and the bridge discovers it at the worst moment — with an
+// incoming HTLC locked in and no way to pay the outgoing leg.
+//
+// The set is deliberately wide. A swap merely quoted has no HTLC yet, but a
+// payer can fund it at any moment, and between "they might" and "they did"
+// there is no chance to re-decide. Paid is excluded because by then the
+// payment has left and the balance already reflects it.
+func Committed(ctx context.Context, s Store) (uint64, error) {
+	pending, err := s.Pending(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("reading pending swaps: %w", err)
+	}
+
+	var total uint64
+	for _, r := range pending {
+		switch r.State {
+		case swap.Quoted, swap.Offered, swap.Funded, swap.Paying:
+			// Saturating, because an overflow here would report a small
+			// commitment for an enormous one, in the direction that
+			// oversells.
+			if total+r.OutgoingMsat < total {
+				return 0, fmt.Errorf("%w: committed amounts overflow",
+					ErrRecord)
+			}
+			total += r.OutgoingMsat
+		}
+	}
+
+	return total, nil
+}

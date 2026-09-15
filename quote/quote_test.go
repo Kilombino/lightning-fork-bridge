@@ -105,6 +105,17 @@ func build(t *testing.T, in *fakeIn, out *fakeOut, spread float64) (*Quoter,
 		Spacing: func(context.Context) (driver.Rates, error) {
 			return driver.Rates{Incoming: blake, Outgoing: btc, As: now}, nil
 		},
+		Room: func(ctx context.Context) (uint64, error) {
+			// Plenty, less whatever is already promised, which is how the
+			// daemon computes it.
+			committed, err := store.Committed(ctx, st)
+			if err != nil {
+				return 0, err
+			}
+			const balance = 10_000_000_000
+
+			return balance - committed, nil
+		},
 		Margin: marg,
 		Policy: DefaultPolicy,
 		Now:    func() time.Time { return now },
@@ -518,6 +529,7 @@ func TestAQuoterMissingADependencyRefuses(t *testing.T) {
 		{"no store", func(q *Quoter) { q.Store = nil }},
 		{"no pricer", func(q *Quoter) { q.Price = nil }},
 		{"no spacing", func(q *Quoter) { q.Spacing = nil }},
+		{"no headroom", func(q *Quoter) { q.Room = nil }},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			// Built fresh rather than copied: a Quoter holds a mutex, so
@@ -546,6 +558,9 @@ func TestConcurrentQuotesForOneHash(t *testing.T) {
 		},
 		Spacing: func(context.Context) (driver.Rates, error) {
 			return driver.Rates{Incoming: blake, Outgoing: btc, As: now}, nil
+		},
+		Room: func(context.Context) (uint64, error) {
+			return 10_000_000_000, nil
 		},
 		Margin: marg, Policy: DefaultPolicy,
 		Now: func() time.Time { return now },
@@ -657,5 +672,73 @@ func TestADecodeFailureStopsEverything(t *testing.T) {
 	}
 	if p, _ := st.Pending(ctx); len(p) != 0 {
 		t.Error("it recorded a swap for something it could not read")
+	}
+}
+
+// TestTheBridgeCannotOversellItsBalance is the gap that inventory pricing
+// exposed: a per-swap cap says nothing about how many swaps are outstanding.
+//
+// Three swaps each comfortably inside MaxSwapMsat can still, together, promise
+// more than the bridge holds. The balance says what could be sent right now;
+// it says nothing about what is already spoken for. Discovering that at the
+// end means an incoming HTLC locked in and no way to pay the outgoing leg.
+func TestTheBridgeCannotOversellItsBalance(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+
+	// Enough for two swaps of 40,000,000 msat and not a third.
+	const balance = 100_000_000
+
+	build := func(hash node.Hash) *Quoter {
+		dec := decoded()
+		dec.Hash = hash
+		dec.AmountMsat = 40_000_000
+
+		return &Quoter{
+			In: &fakeIn{}, Out: &fakeOut{decoded: dec}, Store: st,
+			Price: func(context.Context) (rate.Reading, error) {
+				return reading(0.01), nil
+			},
+			Spacing: func(context.Context) (driver.Rates, error) {
+				return driver.Rates{Incoming: blake, Outgoing: btc,
+					As: now}, nil
+			},
+			Room: func(ctx context.Context) (uint64, error) {
+				committed, err := store.Committed(ctx, st)
+				if err != nil {
+					return 0, err
+				}
+
+				return balance - committed, nil
+			},
+			Margin: marg, Policy: DefaultPolicy,
+			Now: func() time.Time { return now },
+		}
+	}
+
+	for i, h := range []node.Hash{{1}, {2}} {
+		if _, err := build(h).Quote(ctx, "lnbc1x"); err != nil {
+			t.Fatalf("swap %d was refused with room to spare: %v", i+1, err)
+		}
+	}
+
+	// The third is inside the per-swap cap and outside what is left.
+	third := node.Hash{3}
+	_, err := build(third).Quote(ctx, "lnbc1x")
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("the bridge oversold its balance: %v", err)
+	}
+	if _, err := st.Get(ctx, third); !errors.Is(err, store.ErrNotFound) {
+		t.Error("it recorded the swap it could not cover")
+	}
+
+	// Once one finishes, its commitment is released and there is room again.
+	done, _ := st.Get(ctx, node.Hash{1})
+	done.State = swap.Settled
+	if err := st.Put(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := build(third).Quote(ctx, "lnbc1x"); err != nil {
+		t.Errorf("room was not released when a swap finished: %v", err)
 	}
 }

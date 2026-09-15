@@ -24,6 +24,7 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 | `rate` | What rate to quote, or when to refuse to quote at all |
 | `store` | The durable record, which is what recovery reads and therefore what recovery believes |
 | `quote` | Turning "pay this invoice" into a swap, or into a refusal |
+| `inventory` | What to charge, from what the bridge is holding |
 | `runner` | Driving a swap to completion, and what to retry versus what to stop for |
 | `lnd` | The two real nodes, over gRPC |
 | `lndrpc` | Generated protobuf clients, see its own README |
@@ -67,6 +68,19 @@ The rest of the package is refusals: an invoice that expires before the
 incoming leg could be funded, a routing budget wider than the spread it comes
 out of, an incoming amount rounded in the payer's favour on every swap, a
 second hold invoice for a hash that already has one.
+
+`inventory` exists because the number the design most wanted to know in
+advance — how much flow comes back the other way — is not knowable in advance.
+It is demand to be created, not a fact to be measured, and a bridge that had to
+predict it before it could quote would never start. So it is not predicted. The
+spread is a function of the measured position instead: one-way flow drains the
+outgoing side and prices itself at what one-way flow costs (3% at the default
+policy), balanced flow never drains it and sits at the floor (1%), and nobody
+decided which it would be. A swap in the replenishing direction gets a discount
+instead, because it is doing the bridge a favour it would otherwise pay a venue
+for — capped at what that venue would have charged, and lifted rather than
+zeroed when there is no venue at all, since flow is then the only mechanism
+there is.
 
 ## Status
 

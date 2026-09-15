@@ -762,3 +762,71 @@ func TestMemoryCloses(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestCommittedCountsEverythingStillOwed. A swap merely quoted has no HTLC
+// yet, but a payer can fund it at any moment and there is no chance to
+// re-decide in between, so it counts. Paid does not: by then the payment has
+// left and the balance already reflects it.
+func TestCommittedCountsEverythingStillOwed(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+
+	owed := []swap.State{swap.Quoted, swap.Offered, swap.Funded, swap.Paying}
+	notOwed := []swap.State{
+		swap.Paid, swap.Failing, swap.Aborting, swap.Expiring,
+		swap.Settled, swap.Failed, swap.Aborted, swap.Expired, swap.Lost,
+	}
+
+	var n byte
+	for _, st := range append(append([]swap.State{}, owed...), notOwed...) {
+		n++
+		r := rec(n, st)
+		r.OutgoingMsat = 1000
+		if err := s.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := Committed(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := uint64(len(owed)) * 1000; got != want {
+		t.Errorf("committed %d, want %d", got, want)
+	}
+
+	// Every state is accounted for one way or the other, so adding one to
+	// the machine without deciding which it is shows up here.
+	if len(owed)+len(notOwed) != len(allStates()) {
+		t.Errorf("%d states classified, the machine has %d",
+			len(owed)+len(notOwed), len(allStates()))
+	}
+}
+
+func allStates() []swap.State {
+	var out []swap.State
+	for st := swap.Quoted; st <= swap.Lost; st++ {
+		out = append(out, st)
+	}
+
+	return out
+}
+
+// TestCommittedRefusesToUnderreportOnOverflow. Wrapping would report a tiny
+// commitment for an enormous one, in the direction that oversells.
+func TestCommittedRefusesToUnderreportOnOverflow(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+
+	for _, n := range []byte{1, 2} {
+		r := rec(n, swap.Funded)
+		r.OutgoingMsat = ^uint64(0) - 10
+		if err := s.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Committed(ctx, s); !errors.Is(err, ErrRecord) {
+		t.Errorf("want ErrRecord, got %v", err)
+	}
+}

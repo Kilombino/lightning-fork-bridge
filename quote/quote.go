@@ -150,6 +150,12 @@ type Quote struct {
 // Pricer supplies the rate to quote at, or a refusal.
 type Pricer func(ctx context.Context) (rate.Reading, error)
 
+// Headroom supplies how much of the outgoing asset may still be committed:
+// the node's balance, less any reserve, less everything already promised to
+// swaps that have not finished. See store.Committed for the second part, which
+// is the one that is easy to forget and expensive to forget.
+type Headroom func(ctx context.Context) (uint64, error)
+
 // Rates supplies both chains' block spacing, freshly measured. Both are
 // needed: the incoming CLTV is sized by comparing how long the outgoing leg
 // can take against how fast the incoming chain produces blocks, and using one
@@ -163,9 +169,12 @@ type Quoter struct {
 	Out   node.Outgoing
 	Store store.Store
 
-	// Price is the rate oracle, Spacing both chains' block spacing.
+	// Price is the rate oracle, Spacing both chains' block spacing, and Room
+	// what the bridge can still commit. All three are required: a quote made
+	// without any one of them is a promise the bridge has no grounds for.
 	Price   Pricer
 	Spacing Rates
+	Room    Headroom
 
 	// Margin is the HTLC timing policy the incoming CLTV is sized against.
 	Margin margin.Policy
@@ -231,7 +240,7 @@ func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
 		return Quote{}, err
 	}
 	if q.In == nil || q.Out == nil || q.Store == nil || q.Price == nil ||
-		q.Spacing == nil {
+		q.Spacing == nil || q.Room == nil {
 
 		return Quote{}, fmt.Errorf("%w: quoter is missing a dependency",
 			ErrPolicy)
@@ -264,6 +273,20 @@ func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
 			existing.State)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return Quote{}, fmt.Errorf("checking for an existing swap: %w", err)
+	}
+
+	// What the bridge can actually pay, which is not what its balance says:
+	// every swap already quoted, offered or funded is a claim on the same
+	// money. Checked after the duplicate guard so that the amount about to be
+	// committed is not already counted in it.
+	room, err := q.Room(ctx)
+	if err != nil {
+		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	if dec.AmountMsat > room {
+		return Quote{}, fmt.Errorf("%w: %d msat against %d msat of headroom; "+
+			"the rest is promised to swaps that have not finished",
+			ErrRefused, dec.AmountMsat, room)
 	}
 
 	reading, err := q.Price(ctx)
