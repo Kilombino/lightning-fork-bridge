@@ -10,6 +10,7 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -24,6 +25,17 @@ type Hash [32]byte
 
 // Preimage is what settles both legs.
 type Preimage [32]byte
+
+// Hash is the payment hash this preimage settles.
+//
+// It is SHA256 on both chains. The BLAKE2b fork changed how blocks are hashed,
+// not how payments are, and that is the whole reason a swap between the two
+// networks needs no new cryptography: the same preimage claims both HTLCs. Any
+// change here would silently break that, so it is pinned by a test against a
+// vector both chains agree on.
+func (p Preimage) Hash() Hash {
+	return Hash(sha256.Sum256(p[:]))
+}
 
 // InvoiceState is what a hold invoice on the incoming chain is doing.
 type InvoiceState uint8

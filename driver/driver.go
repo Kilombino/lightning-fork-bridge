@@ -23,6 +23,7 @@ import (
 
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/node"
+	"github.com/paulscode/lightning-fork-bridge/store"
 	"github.com/paulscode/lightning-fork-bridge/swap"
 )
 
@@ -41,23 +42,14 @@ var (
 	ErrStaleRates = errors.New("block spacing measurement is stale")
 )
 
-// Swap is the record the driver works from. It holds only what the decisions
-// need; amounts, rates and quote details live with the caller.
-type Swap struct {
-	// Hash appears on both chains.
-	Hash node.Hash
-
-	// State is where the machine has got to.
-	State swap.State
-
-	// Preimage is known once the outgoing leg succeeds.
-	Preimage node.Preimage
-
-	// OutgoingCLTVLimit is the CLTV budget the bridge imposes on the
-	// outgoing payment, in blocks of the outgoing chain. The incoming leg
-	// has to outlive it.
-	OutgoingCLTVLimit uint32
-}
+// Swap is the record the driver works from.
+//
+// It is store.Record, deliberately, rather than a separate working copy. What
+// a restart reads is the disk, so the disk is what the driver has to be
+// deciding against; a second in-memory shape would be one more thing that can
+// disagree with it, and every disagreement between the two resolves into
+// either cancelling a claim against money already sent or sending money twice.
+type Swap = store.Record
 
 // Rates are the block-spacing bounds for both chains, with the moment they
 // were measured.
@@ -81,10 +73,11 @@ type Rates struct {
 // not.
 const DefaultMaxRateAge = 5 * time.Minute
 
-// Driver holds the two nodes and the safety policy.
+// Driver holds the two nodes, the durable record and the safety policy.
 type Driver struct {
 	In     node.Incoming
 	Out    node.Outgoing
+	Store  store.Store
 	Policy margin.Policy
 
 	// MaxRateAge overrides DefaultMaxRateAge. Zero means the default.
@@ -199,6 +192,12 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 	}
 
 	switch sw.State {
+	case swap.Quoted:
+		// The record says nothing was created but the node has the
+		// invoice, so the process died between the two. Catch the record
+		// up rather than leaving an invoice nothing will ever cancel.
+		return swap.InvoiceOffered, true, nil
+
 	case swap.Offered:
 		switch inv.State {
 		case node.InvoiceAccepted:
@@ -226,6 +225,12 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 
 	// Nothing has changed since the crash; the outstanding action is
 	// reissued by the caller using swap.Recoverable.
+	//
+	// swap.Funded is the deliberate gap. What a funded swap needs is not an
+	// action but a fresh decision, and that decision is Gate's: it reads both
+	// chains again, and refuses if the incoming HTLC has stopped being
+	// claimable while the bridge was down. Resuming one by reissuing
+	// something would be guessing at what Gate is there to work out.
 	return 0, false, nil
 }
 
@@ -261,6 +266,13 @@ func (d *Driver) resumePaying(ctx context.Context, sw *Swap) (swap.Event, bool,
 		// against money that has already gone. The two readings call for
 		// opposite actions and the bridge cannot tell them apart, so it
 		// stops and asks.
+		//
+		// This could become decidable. If the outgoing node is shown to
+		// commit its own payment record before dispatching any HTLC,
+		// then "no record" means "never left" and cancelling is safe.
+		// That is a property of a particular node at a particular
+		// version, so it has to be demonstrated in the lab rather than
+		// assumed, and until it is, the answer here is a human.
 		return 0, false, fmt.Errorf("%w: recorded as %v but the outgoing "+
 			"node has no record of the payment; do not cancel the "+
 			"incoming HTLC until the outgoing leg is accounted for",
@@ -293,6 +305,14 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 		if sw.Preimage == zero {
 			return fmt.Errorf("%w: no preimage to settle with", ErrState)
 		}
+		// A preimage that does not hash to this swap's hash settles
+		// nothing. Checking costs one hash and catches the outgoing node
+		// returning the wrong one, in the single state where getting it
+		// wrong is a realised loss rather than a retry.
+		if got := sw.Preimage.Hash(); got != sw.Hash {
+			return fmt.Errorf("%w: the preimage hashes to %x, not %x",
+				ErrState, got, sw.Hash)
+		}
 
 		return d.In.SettleInvoice(ctx, sw.Preimage)
 
@@ -309,12 +329,35 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 // A timeout or transport error yields no event: the payment may still be in
 // flight, and only LookupPayment can say. The swap stays in Paying, which is
 // precisely the state that forbids cancelling the incoming HTLC.
+//
+// Before anything leaves it checks the disk, not memory. A restart reads the
+// disk, so if the disk does not already say this swap might be paying then a
+// crash in the next instant would leave a record that recovery resolves by
+// cancelling the incoming claim, against a payment that had in fact gone out.
+// The check costs one read and closes the only window in which that can
+// happen.
 func (d *Driver) Pay(ctx context.Context, sw *Swap, req node.PayRequest) (
 	swap.Event, bool, error) {
 
 	if sw.State != swap.Paying {
 		return 0, false, fmt.Errorf("%w: pay needs %v, have %v", ErrState,
 			swap.Paying, sw.State)
+	}
+
+	if d.Store == nil {
+		return 0, false, fmt.Errorf("%w: refusing to pay without a durable "+
+			"record", ErrNoStore)
+	}
+	rec, err := d.Store.Get(ctx, sw.Hash)
+	if err != nil {
+		return 0, false, fmt.Errorf("re-reading the swap before paying: %w",
+			err)
+	}
+	if rec.State != swap.Paying {
+		return 0, false, fmt.Errorf("%w: memory says %v but the record says "+
+			"%v; a crash now would be recovered by cancelling the incoming "+
+			"claim against a payment that had already left",
+			ErrState, sw.State, rec.State)
 	}
 
 	pmt, err := d.Out.Pay(ctx, req)

@@ -2,6 +2,7 @@ package swap
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -430,5 +431,38 @@ func TestTestListsAreComplete(t *testing.T) {
 			t.Errorf("allEvents repeats %v", e)
 		}
 		seenE[e] = true
+	}
+}
+
+// TestParseStateRoundTripsEveryState. Records are stored by name, so a state
+// whose name does not survive the trip back is a record that cannot be read
+// after a restart, in a state whose recovery decides whether a claim is given
+// up.
+func TestParseStateRoundTripsEveryState(t *testing.T) {
+	for _, s := range allStates {
+		name := s.String()
+		if strings.HasPrefix(name, "state(") {
+			t.Errorf("%d has no name, so it cannot be stored", uint8(s))
+
+			continue
+		}
+		got, err := ParseState(name)
+		if err != nil {
+			t.Errorf("%v: %v", s, err)
+
+			continue
+		}
+		if got != s {
+			t.Errorf("%q parsed to %v, want %v", name, got, s)
+		}
+	}
+
+	// Names are not interchangeable with numbers, which is the whole reason
+	// for storing them.
+	for _, name := range []string{"", "0", "3", "PAYING", "pay", "half-paid"} {
+		if got, err := ParseState(name); !errors.Is(err, ErrUnknownState) {
+			t.Errorf("%q parsed to %v, %v; want ErrUnknownState", name, got,
+				err)
+		}
 	}
 }

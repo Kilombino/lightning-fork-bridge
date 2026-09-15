@@ -8,6 +8,7 @@ import (
 
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/node"
+	"github.com/paulscode/lightning-fork-bridge/store"
 	"github.com/paulscode/lightning-fork-bridge/swap"
 )
 
@@ -401,7 +402,22 @@ func TestDoActions(t *testing.T) {
 	if in.settled != 0 {
 		t.Error("a settle without a preimage reached the node")
 	}
-	sw := &Swap{State: swap.Paid, Preimage: node.Preimage{7}}
+	// A preimage that settles a different hash must not reach the node: it
+	// would fail, and it would fail in the one state where failing costs the
+	// bridge the whole swap.
+	wrong := node.Preimage{7}
+	if err := d.Do(ctx, &Swap{
+		Hash: node.Hash{1}, State: swap.Paid, Preimage: wrong,
+	}, swap.SettleIncoming); !errors.Is(err, ErrState) {
+
+		t.Errorf("settling with a preimage for another hash: %v", err)
+	}
+	if in.settled != 0 {
+		t.Error("a preimage for the wrong hash reached the node")
+	}
+
+	pre := node.Preimage{7}
+	sw := &Swap{State: swap.Paid, Hash: pre.Hash(), Preimage: pre}
 	if err := d.Do(ctx, sw, swap.SettleIncoming); err != nil {
 		t.Error(err)
 	}
@@ -446,6 +462,20 @@ func TestPayLeavesSwapPayingOnAnUnknownOutcome(t *testing.T) {
 	}
 }
 
+// payingDriver returns a driver whose store already records the swap as
+// paying, which is what Pay requires on disk before anything leaves.
+func payingDriver(t *testing.T, out node.Outgoing, sw *Swap) *Driver {
+	t.Helper()
+
+	st := store.NewMemory()
+	if err := st.Put(context.Background(), *sw); err != nil {
+		t.Fatal(err)
+	}
+
+	return &Driver{In: &fakeIn{}, Out: out, Store: st, Policy: pol,
+		Now: fixedNow}
+}
+
 func TestPayRecordsOutcomes(t *testing.T) {
 	ctx := context.Background()
 	pre := node.Preimage{4, 5, 6}
@@ -453,8 +483,8 @@ func TestPayRecordsOutcomes(t *testing.T) {
 	out := &fakeOut{payment: node.Payment{
 		State: node.PaymentSucceeded, Preimage: pre,
 	}}
-	d := &Driver{In: &fakeIn{}, Out: out, Policy: pol, Now: fixedNow}
-	sw := &Swap{State: swap.Paying}
+	sw := &Swap{Hash: pre.Hash(), State: swap.Paying, Created: fixedNow()}
+	d := payingDriver(t, out, sw)
 	ev, ok, err := d.Pay(ctx, sw, node.PayRequest{})
 	if err != nil || !ok || ev != swap.OutgoingSucceeded {
 		t.Fatalf("%v %v %v", ev, ok, err)
@@ -464,8 +494,9 @@ func TestPayRecordsOutcomes(t *testing.T) {
 	}
 
 	out = &fakeOut{payment: node.Payment{State: node.PaymentFailed}}
-	d = &Driver{In: &fakeIn{}, Out: out, Policy: pol, Now: fixedNow}
-	ev, ok, err = d.Pay(ctx, &Swap{State: swap.Paying}, node.PayRequest{})
+	failed := &Swap{Hash: node.Hash{9}, State: swap.Paying, Created: fixedNow()}
+	d = payingDriver(t, out, failed)
+	ev, ok, err = d.Pay(ctx, failed, node.PayRequest{})
 	if err != nil || !ok || ev != swap.OutgoingFailed {
 		t.Fatalf("%v %v %v", ev, ok, err)
 	}
@@ -493,16 +524,29 @@ func TestFullRunThroughTheMachine(t *testing.T) {
 	out := &fakeOut{payment: node.Payment{
 		State: node.PaymentSucceeded, Preimage: pre,
 	}}
-	d := &Driver{In: in, Out: out, Policy: pol, Now: fixedNow}
-	sw := &Swap{State: swap.Quoted, OutgoingCLTVLimit: 40}
+	st := store.NewMemory()
+	d := &Driver{In: in, Out: out, Store: st, Policy: pol, Now: fixedNow}
+	sw := &Swap{
+		Hash: pre.Hash(), State: swap.Quoted, OutgoingCLTVLimit: 40,
+		Created: fixedNow(),
+	}
 
 	step := func(e swap.Event) swap.Action {
 		t.Helper()
-		next, action, err := swap.Step(sw.State, e)
+		action, err := d.Apply(ctx, sw, e)
 		if err != nil {
 			t.Fatalf("%v on %v: %v", e, sw.State, err)
 		}
-		sw.State = next
+		// Every transition must be on disk by the time its action is
+		// handed back, because the action may be the irreversible one.
+		rec, err := st.Get(ctx, sw.Hash)
+		if err != nil {
+			t.Fatalf("after %v the swap was not recorded: %v", e, err)
+		}
+		if rec.State != sw.State {
+			t.Fatalf("after %v memory says %v, the record says %v", e,
+				sw.State, rec.State)
+		}
 
 		return action
 	}

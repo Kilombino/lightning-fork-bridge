@@ -95,6 +95,28 @@ func (s State) String() string {
 	return fmt.Sprintf("state(%d)", uint8(s))
 }
 
+// ErrUnknownState is returned by ParseState for a name it does not recognise.
+var ErrUnknownState = errors.New("unknown swap state")
+
+// ParseState turns a state's name back into a State.
+//
+// Anything that stores or transmits a state should use its name and not its
+// numeric value. The numbers are positions in an iota block, so inserting a
+// state in the middle would silently reinterpret every record already written:
+// a swap recorded as paying would come back as something else entirely, and
+// the recovery for the wrong state is how money is lost. Names do not have
+// that failure mode, because a name that no longer exists is an error rather
+// than a different state.
+func ParseState(name string) (State, error) {
+	for s, n := range stateNames {
+		if n == name {
+			return s, nil
+		}
+	}
+
+	return 0, fmt.Errorf("%w: %q", ErrUnknownState, name)
+}
+
 // Terminal reports whether a swap has finished and needs no further work.
 func (s State) Terminal() bool {
 	switch s {
