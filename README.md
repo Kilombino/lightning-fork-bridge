@@ -23,6 +23,8 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 | `driver` | When to pay, and what a swap interrupted mid-flight should do |
 | `rate` | What rate to quote, or when to refuse to quote at all |
 | `store` | The durable record, which is what recovery reads and therefore what recovery believes |
+| `lnd` | The two real nodes, over gRPC |
+| `lndrpc` | Generated protobuf clients, see its own README |
 
 `margin` and `confirm` exist because block counts mean different things on the
 two chains. The BLAKE2b chain has run between 1.3x and 19x faster than its ten
@@ -38,11 +40,22 @@ it time, and it cancels its claim on the money coming in.
 `TestTheOrderingRuleIsWhatPreventsTheLoss` runs exactly those facts twice with
 only that ordering changed, and gets opposite answers.
 
+`lnd` holds two translations worth reading twice, because every rule above
+them is reasoning about what they report. A multi-part payment's expiry height
+is the **minimum** across its accepted HTLCs, not the invoice's nominal delta,
+because the claim on the whole invoice dies with the earliest part. And a
+payment is reported failed only when the node says failed: a broken stream, a
+deadline, a status this build has never seen all come back as in flight,
+because `OutgoingFailed` is the single event that lets the bridge give up its
+incoming claim.
+
 ## Status
 
-The logic that decides things is built and tested, and so is the record it
-decides against. What is not built is the gRPC to real nodes, and the quote and
-payout surfaces above them.
+The logic that decides things is built and tested, the record it decides
+against is built and tested, and the adapters to real nodes are built and
+tested against an in-process gRPC server. What is not built is the event loop
+that runs them, and the quote and payout surfaces above it. Nothing has been
+run against a live node yet.
 
 Nothing here has moved money. The order was deliberate: the parts that lose
 funds when they are wrong are the parts that can be tested exhaustively
