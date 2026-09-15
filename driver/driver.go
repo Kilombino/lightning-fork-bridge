@@ -267,15 +267,30 @@ func (d *Driver) resumePaying(ctx context.Context, sw *Swap) (swap.Event, bool,
 		// opposite actions and the bridge cannot tell them apart, so it
 		// stops and asks.
 		//
-		// This could become decidable. If the outgoing node is shown to
-		// commit its own payment record before dispatching any HTLC,
-		// then "no record" means "never left" and cancelling is safe.
-		// That is a property of a particular node at a particular
-		// version, so it has to be demonstrated in the lab rather than
-		// assumed, and until it is, the answer here is a human.
+		// Experiment S14, run against lnd v0.21.3-beta on 2026-09-15,
+		// showed the record is written before any HTLC is dispatched: a
+		// payment on a node with no channels at all was reported
+		// IN_FLIGHT before failing to find a route. So in the ordinary
+		// case "no record" does mean "never left", and cancelling would
+		// be safe.
+		//
+		// It still stops here, because the two readings that survive
+		// that evidence are the ones an operator has to rule out and
+		// this process cannot: a node database restored from a backup
+		// older than the payment, and payments deleted by hand. The
+		// window this can even arise in is the few milliseconds between
+		// the record becoming durable and the node accepting the send,
+		// so escalating costs an operator's attention about once never,
+		// while being wrong costs the swap.
 		return 0, false, fmt.Errorf("%w: recorded as %v but the outgoing "+
-			"node has no record of the payment; do not cancel the "+
-			"incoming HTLC until the outgoing leg is accounted for",
+			"node has no record of the payment. S14 established that this "+
+			"node writes its payment record before dispatching any HTLC, "+
+			"so the payment almost certainly never left and cancelling "+
+			"the incoming HTLC is almost certainly safe. Confirm first "+
+			"that the node's database was not restored from a backup and "+
+			"that no payments were deleted by hand, because those are the "+
+			"two cases where this reading is wrong and the claim is all "+
+			"there is against money already gone",
 			ErrNeedsOperator, swap.Paying)
 	}
 

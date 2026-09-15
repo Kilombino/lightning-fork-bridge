@@ -47,6 +47,16 @@ type Config struct {
 	// payment permissions; admin.macaroon works and is more than it needs.
 	MacaroonPath string
 
+	// ServerName overrides the name the certificate is checked against.
+	//
+	// LND's self-signed certificate covers the names it was told about at
+	// first start, which frequently do not include the address the bridge
+	// actually reaches it on: a container IP, a tunnel endpoint, a port
+	// forward. Empty means use the host from Address, which is right when
+	// they do match. Setting it does not weaken anything — the certificate
+	// is still the only root accepted.
+	ServerName string
+
 	// Timeout bounds the initial connection. Zero means 30 seconds.
 	Timeout time.Duration
 }
@@ -82,7 +92,8 @@ func Dial(ctx context.Context, cfg Config) (*grpc.ClientConn, error) {
 		return nil, fmt.Errorf("%w: no address", ErrConfig)
 	}
 
-	creds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath, "")
+	creds, err := credentials.NewClientTLSFromFile(cfg.TLSCertPath,
+		cfg.ServerName)
 	if err != nil {
 		return nil, fmt.Errorf("%w: reading %s: %w", ErrConfig,
 			cfg.TLSCertPath, err)
