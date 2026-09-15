@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -235,4 +236,55 @@ func (o *Outgoing) Check(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ErrInvoice is returned for a payment request the bridge will not act on.
+var ErrInvoice = errors.New("payment request is not usable")
+
+// Decode reads a payment request using the node that will pay it.
+func (o *Outgoing) Decode(ctx context.Context, invoice string) (node.Decoded,
+	error) {
+
+	if invoice == "" {
+		return node.Decoded{}, fmt.Errorf("%w: empty", ErrInvoice)
+	}
+
+	req, err := o.main.DecodePayReq(ctx, &lnrpc.PayReqString{PayReq: invoice})
+	if err != nil {
+		return node.Decoded{}, fmt.Errorf("%w: %w", ErrInvoice, err)
+	}
+
+	var out node.Decoded
+	h, err := hex.DecodeString(req.GetPaymentHash())
+	if err != nil || len(h) != len(out.Hash) {
+		return node.Decoded{}, fmt.Errorf("%w: payment hash %q",
+			ErrInvoice, req.GetPaymentHash())
+	}
+	copy(out.Hash[:], h)
+
+	msat := req.GetNumMsat()
+	if msat < 0 {
+		return node.Decoded{}, fmt.Errorf("%w: negative amount %d", ErrInvoice,
+			msat)
+	}
+	out.AmountMsat = uint64(msat)
+
+	cltv := req.GetCltvExpiry()
+	if cltv < 0 || cltv > 1<<31-1 {
+		return node.Decoded{}, fmt.Errorf("%w: CLTV delta %d", ErrInvoice,
+			cltv)
+	}
+	out.CLTVDelta = uint32(cltv)
+
+	// Timestamp plus expiry, because an invoice's expiry is relative to when
+	// it was created and the bridge cares about the wall-clock moment.
+	if ts := req.GetTimestamp(); ts > 0 {
+		out.Expiry = time.Unix(ts, 0).Add(
+			time.Duration(req.GetExpiry()) * time.Second)
+	}
+
+	out.Destination = req.GetDestination()
+	out.Description = req.GetDescription()
+
+	return out, nil
 }

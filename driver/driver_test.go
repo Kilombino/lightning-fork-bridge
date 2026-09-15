@@ -73,6 +73,12 @@ func (f *fakeOut) LookupPayment(context.Context, node.Hash) (node.Payment, error
 	return f.lookup, f.lookupErr
 }
 
+// Decode reads a payment request. The bridge uses the paying node's own
+// decoder so that no second parser can disagree about the payment hash.
+func (f *fakeOut) Decode(context.Context, string) (node.Decoded, error) {
+	return node.Decoded{}, nil
+}
+
 func (f *fakeOut) BlockHeight(context.Context) (int32, error) { return 0, nil }
 
 var (

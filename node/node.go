@@ -194,8 +194,44 @@ type Incoming interface {
 	BlockHeight(ctx context.Context) (int32, error)
 }
 
+// Decoded is a payment request the bridge has been asked to pay, as the node
+// that will pay it reads it.
+type Decoded struct {
+	// Hash is the payment hash. The incoming hold invoice is built on this
+	// exact value, which is what makes the two legs one swap.
+	Hash Hash
+
+	// AmountMsat is what the invoice asks for. Zero means the invoice names
+	// no amount, which the bridge refuses: the outgoing leg would be for
+	// whatever it chose and the incoming one priced against a guess.
+	AmountMsat uint64
+
+	// CLTVDelta is the final hop's required delta, in blocks of the outgoing
+	// chain. It is part of what the outgoing leg will cost in time.
+	CLTVDelta uint32
+
+	// Expiry is when the invoice stops being payable.
+	Expiry time.Time
+
+	// Destination is who gets paid, for logs and for refusing to pay
+	// ourselves.
+	Destination string
+
+	// Description is what the payer will see quoted back to them.
+	Description string
+}
+
 // Outgoing is the node the bridge pays on.
 type Outgoing interface {
+	// Decode reads a payment request.
+	//
+	// This is deliberately the paying node's own decoder rather than a
+	// second one in this process. A separate parser that disagreed by one
+	// field would let the bridge build a hold invoice around one payment
+	// hash while the node paid another, and the swap's entire security is
+	// that those are the same value.
+	Decode(ctx context.Context, invoice string) (Decoded, error)
+
 	// Pay sends a payment and blocks until it resolves or the request's
 	// timeout elapses. A timeout is not a failure: the payment may still be
 	// in flight, and LookupPayment is the only way to find out.

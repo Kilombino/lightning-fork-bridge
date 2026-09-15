@@ -23,6 +23,7 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 | `driver` | When to pay, and what a swap interrupted mid-flight should do |
 | `rate` | What rate to quote, or when to refuse to quote at all |
 | `store` | The durable record, which is what recovery reads and therefore what recovery believes |
+| `quote` | Turning "pay this invoice" into a swap, or into a refusal |
 | `runner` | Driving a swap to completion, and what to retry versus what to stop for |
 | `lnd` | The two real nodes, over gRPC |
 | `lndrpc` | Generated protobuf clients, see its own README |
@@ -58,11 +59,21 @@ A node that did not answer says nothing about the swap, and abandoning a live
 HTLC over a blip is how one expires; an inconsistency, or anything the bridge
 has said it must not decide alone, must not be repeated at all.
 
+`quote` never chooses the payment hash. It comes from the invoice the user
+asked to have paid, read by **the node that will pay it** rather than by a
+second parser in this process, because a parser that disagreed by one field
+would have the bridge hold an invoice for one hash while the node paid another.
+The rest of the package is refusals: an invoice that expires before the
+incoming leg could be funded, a routing budget wider than the spread it comes
+out of, an incoming amount rounded in the payer's favour on every swap, a
+second hold invoice for a hash that already has one.
+
 ## Status
 
 Built and tested: the logic that decides, the record it decides against, the
-adapters to real nodes, and the loop that drives a swap to completion. Not
-built: the quote surface that creates swaps, and the payout adapter.
+adapters to real nodes, the loop that drives a swap to completion, and the
+quote surface that creates one. Not built: the payout adapter, and the daemon
+that wires these together behind a configuration file.
 
 Nothing has been run against a live node yet.
 

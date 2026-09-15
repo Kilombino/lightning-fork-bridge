@@ -43,6 +43,9 @@ type fakeNode struct {
 	info    *lnrpc.GetInfoResponse
 	infoErr error
 
+	payreq    *lnrpc.PayReq
+	payreqErr error
+
 	invoice    *lnrpc.Invoice
 	invoiceErr error
 
@@ -65,6 +68,12 @@ func (f *fakeNode) GetInfo(context.Context, *lnrpc.GetInfoRequest) (
 	*lnrpc.GetInfoResponse, error) {
 
 	return f.info, f.infoErr
+}
+
+func (f *fakeNode) DecodePayReq(context.Context, *lnrpc.PayReqString) (
+	*lnrpc.PayReq, error) {
+
+	return f.payreq, f.payreqErr
 }
 
 func (f *fakeNode) AddHoldInvoice(_ context.Context,
@@ -816,5 +825,104 @@ func TestTheMacaroonIsNeverSentInTheClear(t *testing.T) {
 	}
 	if md["macaroon"] != "aabb" {
 		t.Errorf("metadata %v", md)
+	}
+}
+
+// TestDecodeUsesThePayingNodesReading. The bridge builds its hold invoice
+// around whatever payment hash comes back here, and the node that pays will
+// use its own reading of the same string. A second parser in this process that
+// disagreed by one field would have the two legs built on different hashes,
+// which is the one thing the swap's security rests on them not doing.
+func TestDecodeUsesThePayingNodesReading(t *testing.T) {
+	ctx := context.Background()
+	created := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	want := node.Hash{1, 2, 3, 4}
+
+	f := &fakeNode{info: synced, payreq: &lnrpc.PayReq{
+		Destination: "03abc",
+		PaymentHash: hex.EncodeToString(want[:]),
+		NumMsat:     100_000_000,
+		CltvExpiry:  40,
+		Timestamp:   created.Unix(),
+		Expiry:      3600,
+		Description: "a coffee",
+	}}
+	out := NewOutgoing(serve(t, f))
+
+	got, err := out.Decode(ctx, "lnbc1fake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hash != want {
+		t.Errorf("hash %x, want %x", got.Hash, want)
+	}
+	if got.AmountMsat != 100_000_000 {
+		t.Errorf("amount %d", got.AmountMsat)
+	}
+	if got.CLTVDelta != 40 {
+		t.Errorf("cltv %d", got.CLTVDelta)
+	}
+	// Expiry is relative to the invoice's own timestamp, and the bridge
+	// needs the wall-clock moment.
+	if !got.Expiry.Equal(created.Add(time.Hour)) {
+		t.Errorf("expiry %v, want %v", got.Expiry, created.Add(time.Hour))
+	}
+	if got.Destination != "03abc" || got.Description != "a coffee" {
+		t.Errorf("%+v", got)
+	}
+}
+
+func TestDecodeRefusesWhatItCannotUse(t *testing.T) {
+	ctx := context.Background()
+	good := func() *lnrpc.PayReq {
+		return &lnrpc.PayReq{
+			PaymentHash: hex.EncodeToString(make([]byte, 32)),
+			NumMsat:     1000, CltvExpiry: 40, Timestamp: 1_700_000_000,
+		}
+	}
+
+	for _, c := range []struct {
+		name string
+		with func(p *lnrpc.PayReq)
+	}{
+		{"a hash that is not hex", func(p *lnrpc.PayReq) {
+			p.PaymentHash = "zzzz"
+		}},
+		{"a hash of the wrong length", func(p *lnrpc.PayReq) {
+			p.PaymentHash = "aabb"
+		}},
+		{"a negative amount", func(p *lnrpc.PayReq) { p.NumMsat = -1 }},
+		{"a CLTV delta that does not fit", func(p *lnrpc.PayReq) {
+			p.CltvExpiry = 1 << 40
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p := good()
+			c.with(p)
+			out := NewOutgoing(serve(t, &fakeNode{info: synced, payreq: p}))
+
+			if _, err := out.Decode(ctx, "lnbc1x"); !errors.Is(err,
+				ErrInvoice) {
+
+				t.Errorf("want ErrInvoice, got %v", err)
+			}
+		})
+	}
+
+	// An empty string never reaches the node.
+	f := &fakeNode{info: synced, payreq: good()}
+	if _, err := NewOutgoing(serve(t, f)).Decode(ctx, ""); !errors.Is(err,
+		ErrInvoice) {
+
+		t.Errorf("empty: %v", err)
+	}
+
+	// And a node that refuses to decode is a refusal, not a silent zero.
+	bad := &fakeNode{info: synced,
+		payreqErr: status.Error(codes.InvalidArgument, "checksum failed")}
+	if _, err := NewOutgoing(serve(t, bad)).Decode(ctx,
+		"lnbc1garbage"); !errors.Is(err, ErrInvoice) {
+
+		t.Errorf("undecodable: %v", err)
 	}
 }
