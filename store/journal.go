@@ -34,6 +34,8 @@ type wire struct {
 	Invoice   string    `json:"invoice,omitempty"`
 	InMsat    uint64    `json:"incoming_msat,omitempty"`
 	OutMsat   uint64    `json:"outgoing_msat,omitempty"`
+	MaxFee    uint64    `json:"max_fee_msat,omitempty"`
+	Expires   time.Time `json:"quote_expiry,omitempty"`
 	Rate      float64   `json:"rate,omitempty"`
 	Spread    float64   `json:"spread,omitempty"`
 	Created   time.Time `json:"created"`
@@ -49,6 +51,8 @@ func toWire(r Record) wire {
 		Invoice:   r.Invoice,
 		InMsat:    r.IncomingMsat,
 		OutMsat:   r.OutgoingMsat,
+		MaxFee:    r.MaxFeeMsat,
+		Expires:   r.QuoteExpiry,
 		Rate:      r.Rate,
 		Spread:    r.Spread,
 		Created:   r.Created,
@@ -90,6 +94,8 @@ func (w wire) record() (Record, error) {
 	r.Invoice = w.Invoice
 	r.IncomingMsat = w.InMsat
 	r.OutgoingMsat = w.OutMsat
+	r.MaxFeeMsat = w.MaxFee
+	r.QuoteExpiry = w.Expires
 	r.Rate = w.Rate
 	r.Spread = w.Spread
 	r.Created = w.Created

@@ -23,6 +23,7 @@ chain and a stock LND for Bitcoin. Nothing here runs on both chains.
 | `driver` | When to pay, and what a swap interrupted mid-flight should do |
 | `rate` | What rate to quote, or when to refuse to quote at all |
 | `store` | The durable record, which is what recovery reads and therefore what recovery believes |
+| `runner` | Driving a swap to completion, and what to retry versus what to stop for |
 | `lnd` | The two real nodes, over gRPC |
 | `lndrpc` | Generated protobuf clients, see its own README |
 
@@ -49,13 +50,21 @@ deadline, a status this build has never seen all come back as in flight,
 because `OutgoingFailed` is the single event that lets the bridge give up its
 incoming claim.
 
+`runner` holds two rules. One goroutine per payment hash, ever: a swap's
+safety is a sequence — read the nodes, decide, record, act — and two goroutines
+interleaving it can gate against one reading and pay against another. And a
+split between failures that must be retried and failures that must not.
+A node that did not answer says nothing about the swap, and abandoning a live
+HTLC over a blip is how one expires; an inconsistency, or anything the bridge
+has said it must not decide alone, must not be repeated at all.
+
 ## Status
 
-The logic that decides things is built and tested, the record it decides
-against is built and tested, and the adapters to real nodes are built and
-tested against an in-process gRPC server. What is not built is the event loop
-that runs them, and the quote and payout surfaces above it. Nothing has been
-run against a live node yet.
+Built and tested: the logic that decides, the record it decides against, the
+adapters to real nodes, and the loop that drives a swap to completion. Not
+built: the quote surface that creates swaps, and the payout adapter.
+
+Nothing has been run against a live node yet.
 
 Nothing here has moved money. The order was deliberate: the parts that lose
 funds when they are wrong are the parts that can be tested exhaustively

@@ -69,6 +69,19 @@ type Record struct {
 	IncomingMsat uint64
 	OutgoingMsat uint64
 
+	// MaxFeeMsat caps what may be spent on routing the outgoing leg. It is
+	// part of the quote: a payment that cost more than this would eat the
+	// spread the swap was priced with.
+	MaxFeeMsat uint64
+
+	// QuoteExpiry is when the rate stops being honoured.
+	//
+	// It is wall-clock rather than a block height because what it bounds is
+	// price risk, and price moves with time, not with blocks. A swap that
+	// reaches this unfunded is cancelled; one already funded is decided by
+	// the margin check instead, which is about blocks.
+	QuoteExpiry time.Time
+
 	// Rate is the outgoing-per-incoming price the quote was struck at, and
 	// Spread the fraction charged over it. Kept because a quote that was
 	// honoured at a rate nobody can reproduce later is indistinguishable from
