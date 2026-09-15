@@ -595,3 +595,154 @@ func TestAFundedSwapComesBackForTheGate(t *testing.T) {
 		t.Errorf("gate on a lapsed claim: %v %v", ev, err)
 	}
 }
+
+// TestASequencedSwapKeepsItsOwnPreimage is the behaviour that makes a payout
+// possible at all.
+//
+// The recipient's node issued the outgoing invoice and chose its own preimage.
+// That preimage settles nothing on the incoming side, and writing it over the
+// one the bridge chose would replace a working claim with one the incoming
+// node rejects — turning every payout into a realised loss at the last step.
+func TestASequencedSwapKeepsItsOwnPreimage(t *testing.T) {
+	ctx := context.Background()
+
+	ours := node.Preimage{0x11}
+	theirs := node.Preimage{0x22}
+	outHash := theirs.Hash()
+
+	sw := &Swap{
+		Hash: ours.Hash(), State: swap.Paying, OutgoingCLTVLimit: 40,
+		Binding: swap.Sequenced, Preimage: ours, OutgoingHash: outHash,
+		Created: fixedNow(),
+	}
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted,
+		ExpiryHeight: 1000}, height: 500}
+	out := &fakeOut{lookup: node.Payment{
+		State: node.PaymentSucceeded, Preimage: theirs,
+	}}
+	d, _ := recorded(t, in, out, sw)
+
+	found, err := d.Recover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := found[0]
+	if r.Err != nil {
+		t.Fatal(r.Err)
+	}
+	if !r.HasEvent || r.Event != swap.OutgoingSucceeded {
+		t.Fatalf("want OutgoingSucceeded, got %v", r.Event)
+	}
+
+	// Ours is untouched; theirs is kept as evidence that we paid.
+	if r.Swap.Preimage != ours {
+		t.Errorf("the incoming preimage became %x, want ours %x",
+			r.Swap.Preimage, ours)
+	}
+	if r.Swap.OutgoingPreimage != theirs {
+		t.Errorf("the outgoing preimage was not recorded: %x",
+			r.Swap.OutgoingPreimage)
+	}
+
+	action, err := d.Apply(ctx, &r.Swap, r.Event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if action != swap.SettleIncoming {
+		t.Fatalf("want SettleIncoming, got %v", action)
+	}
+	if err := d.Do(ctx, &r.Swap, action); err != nil {
+		t.Fatalf("settling a sequenced swap: %v", err)
+	}
+	if in.settled != 1 {
+		t.Error("the incoming leg was not claimed")
+	}
+}
+
+// TestASequencedSwapLooksUpTheRightPayment. The legs have different hashes, so
+// asking the outgoing node about the incoming one finds nothing — and "no
+// record" is the answer that stops the bridge and calls an operator.
+func TestASequencedSwapLooksUpTheRightPayment(t *testing.T) {
+	ctx := context.Background()
+
+	ours := node.Preimage{0x11}
+	theirs := node.Preimage{0x22}
+	outHash := theirs.Hash()
+
+	out := &fakeOut{lookups: map[node.Hash]node.Payment{
+		outHash: {State: node.PaymentSucceeded, Preimage: theirs},
+		// Asking about the incoming hash finds nothing, which is what a
+		// node would say.
+		ours.Hash(): {State: node.PaymentNone},
+	}}
+	sw := &Swap{
+		Hash: ours.Hash(), State: swap.Paying, OutgoingCLTVLimit: 40,
+		Binding: swap.Sequenced, Preimage: ours, OutgoingHash: outHash,
+		Created: fixedNow(),
+	}
+	d, _ := recorded(t, &fakeIn{invoice: node.Invoice{
+		State: node.InvoiceAccepted, ExpiryHeight: 1000,
+	}, height: 500}, out, sw)
+
+	found, err := d.Recover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found[0].Err != nil {
+		t.Fatalf("it looked up the incoming hash and stopped: %v", found[0].Err)
+	}
+	if found[0].Event != swap.OutgoingSucceeded {
+		t.Errorf("want OutgoingSucceeded, got %v", found[0].Event)
+	}
+}
+
+// TestSettlingBeforeThePaymentSucceededIsRefused.
+//
+// For a hash-linked swap this is belt and braces; the bridge holds no usable
+// preimage before then. For a sequenced swap it is the whole protection: the
+// bridge chose the incoming preimage before any money moved and could settle
+// whenever it liked, so the recipient's guarantee that they are paid first
+// rests on exactly this.
+func TestSettlingBeforeThePaymentSucceededIsRefused(t *testing.T) {
+	ctx := context.Background()
+	ours := node.Preimage{0x11}
+
+	for _, state := range []swap.State{
+		swap.Quoted, swap.Offered, swap.Funded, swap.Paying,
+		swap.Failing, swap.Aborting, swap.Expiring, swap.Settled,
+	} {
+		in := &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted}}
+		d := &Driver{In: in, Out: &fakeOut{}, Store: store.NewMemory(),
+			Policy: pol, Now: fixedNow}
+
+		sw := &Swap{
+			Hash: ours.Hash(), State: state, Binding: swap.Sequenced,
+			Preimage: ours, OutgoingHash: node.Hash{0x99},
+			Created: fixedNow(),
+		}
+		if err := d.Do(ctx, sw, swap.SettleIncoming); !errors.Is(err,
+			ErrState) {
+
+			t.Errorf("%v: settling was allowed: %v", state, err)
+		}
+		if in.settled != 0 {
+			t.Errorf("%v: a settle reached the node before the recipient "+
+				"was paid", state)
+		}
+	}
+
+	// And from Paid it works, or nothing could ever complete.
+	in := &fakeIn{invoice: node.Invoice{State: node.InvoiceAccepted}}
+	d := &Driver{In: in, Out: &fakeOut{}, Store: store.NewMemory(),
+		Policy: pol, Now: fixedNow}
+	sw := &Swap{
+		Hash: ours.Hash(), State: swap.Paid, Binding: swap.Sequenced,
+		Preimage: ours, OutgoingHash: node.Hash{0x99}, Created: fixedNow(),
+	}
+	if err := d.Do(ctx, sw, swap.SettleIncoming); err != nil {
+		t.Fatalf("settling from Paid: %v", err)
+	}
+	if in.settled != 1 {
+		t.Error("the settle did not reach the node")
+	}
+}

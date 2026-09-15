@@ -30,6 +30,9 @@ type wire struct {
 	Hash      string    `json:"hash"`
 	State     string    `json:"state"`
 	Preimage  string    `json:"preimage,omitempty"`
+	Binding   string    `json:"binding"`
+	OutHash   string    `json:"outgoing_hash,omitempty"`
+	OutPre    string    `json:"outgoing_preimage,omitempty"`
 	CLTVLimit uint32    `json:"outgoing_cltv_limit,omitempty"`
 	Invoice   string    `json:"invoice,omitempty"`
 	InMsat    uint64    `json:"incoming_msat,omitempty"`
@@ -47,6 +50,7 @@ func toWire(r Record) wire {
 	w := wire{
 		Hash:      hex.EncodeToString(r.Hash[:]),
 		State:     r.State.String(),
+		Binding:   r.Binding.String(),
 		CLTVLimit: r.OutgoingCLTVLimit,
 		Invoice:   r.Invoice,
 		InMsat:    r.IncomingMsat,
@@ -59,9 +63,16 @@ func toWire(r Record) wire {
 		Updated:   r.Updated,
 		Note:      r.Note,
 	}
-	var zero node.Preimage
-	if r.Preimage != zero {
+	var zeroPre node.Preimage
+	if r.Preimage != zeroPre {
 		w.Preimage = hex.EncodeToString(r.Preimage[:])
+	}
+	if r.OutgoingPreimage != zeroPre {
+		w.OutPre = hex.EncodeToString(r.OutgoingPreimage[:])
+	}
+	var zeroHash node.Hash
+	if r.OutgoingHash != zeroHash {
+		w.OutHash = hex.EncodeToString(r.OutgoingHash[:])
 	}
 
 	return w
@@ -88,6 +99,36 @@ func (w wire) record() (Record, error) {
 			return r, fmt.Errorf("%w: bad preimage for %s", ErrCorrupt, w.Hash)
 		}
 		copy(r.Preimage[:], p)
+	}
+	if w.OutPre != "" {
+		p, err := hex.DecodeString(w.OutPre)
+		if err != nil || len(p) != len(r.OutgoingPreimage) {
+			return r, fmt.Errorf("%w: bad outgoing preimage for %s",
+				ErrCorrupt, w.Hash)
+		}
+		copy(r.OutgoingPreimage[:], p)
+	}
+	if w.OutHash != "" {
+		h, err := hex.DecodeString(w.OutHash)
+		if err != nil || len(h) != len(r.OutgoingHash) {
+			return r, fmt.Errorf("%w: bad outgoing hash for %s", ErrCorrupt,
+				w.Hash)
+		}
+		copy(r.OutgoingHash[:], h)
+	}
+
+	// Records written before bindings existed named no binding, and the
+	// empty string is not a binding. They are all hash-linked, which is the
+	// arrangement that was possible at the time, and reading them as the
+	// weaker one would trust them less rather than more.
+	if w.Binding == "" {
+		r.Binding = swap.HashLinked
+	} else {
+		b, err := swap.ParseBinding(w.Binding)
+		if err != nil {
+			return r, fmt.Errorf("%w: %w", ErrCorrupt, err)
+		}
+		r.Binding = b
 	}
 
 	r.OutgoingCLTVLimit = w.CLTVLimit

@@ -50,9 +50,27 @@ type Record struct {
 	// State is where the machine has got to.
 	State swap.State
 
-	// Preimage is known once the outgoing leg succeeds. Until then it is
-	// zero, and a zero preimage is why SettleIncoming refuses.
+	// Binding is what makes the two legs one transaction, and the two kinds
+	// do not offer the same assurance. See swap.Binding.
+	Binding swap.Binding
+
+	// Preimage settles the **incoming** leg. Where it comes from depends on
+	// the binding: a hash-linked swap learns it from the outgoing leg and
+	// holds nothing until then, while a sequenced swap chooses it before
+	// issuing the hold invoice and must already have it here.
 	Preimage node.Preimage
+
+	// OutgoingHash is the payment hash of the outgoing leg, when it differs
+	// from the incoming one. Zero means the legs share a hash, which is the
+	// hash-linked case and the only one where sharing is possible.
+	OutgoingHash node.Hash
+
+	// OutgoingPreimage is proof the outgoing leg was paid. For a hash-linked
+	// swap it is the same value as Preimage and is what makes the claim
+	// possible; for a sequenced swap it settles nothing here and is kept as
+	// evidence, because "we paid them" is the fact an operator needs when a
+	// recipient says otherwise.
+	OutgoingPreimage node.Preimage
 
 	// OutgoingCLTVLimit is the CLTV budget imposed on the outgoing payment,
 	// in blocks of the outgoing chain. The incoming leg has to outlive it.
@@ -123,7 +141,69 @@ func (r Record) Valid() error {
 			r.Hash)
 	}
 
+	// The outgoing preimage is the evidence that the outgoing leg was paid,
+	// and evidence nobody checks is not evidence. For a hash-linked swap the
+	// check above already covers it, because the two are the same value; for
+	// a sequenced one nothing else would ever catch a node handing back a
+	// preimage for some other payment.
+	if r.OutgoingPreimage != zeroPre &&
+		r.OutgoingPreimage.Hash() != r.Outgoing() {
+
+		return fmt.Errorf("%w: the outgoing preimage settles %x, not the %x "+
+			"this swap was paying", ErrRecord, r.OutgoingPreimage.Hash(),
+			r.Outgoing())
+	}
+
+	if _, err := swap.ParseBinding(r.Binding.String()); err != nil {
+		return fmt.Errorf("%w: %w", ErrRecord, err)
+	}
+
+	switch r.Binding {
+	case swap.HashLinked:
+		// Sharing a hash is the whole of this binding's security. A record
+		// that claims it while naming a different outgoing hash is
+		// describing a swap that has no binding at all.
+		if r.OutgoingHash != zeroHash && r.OutgoingHash != r.Hash {
+			return fmt.Errorf("%w: a hash-linked swap cannot pay %x while "+
+				"holding %x", ErrRecord, r.OutgoingHash, r.Hash)
+		}
+
+	case swap.Sequenced:
+		if r.OutgoingHash == zeroHash {
+			return fmt.Errorf("%w: a sequenced swap needs the outgoing hash; "+
+				"without it there is nothing to look the payment up by",
+				ErrRecord)
+		}
+		if r.OutgoingHash == r.Hash {
+			// Then it is hash-linked and should say so, and be trusted
+			// accordingly. Recording the stronger arrangement as the weaker
+			// one is harmless; the reverse is not.
+			return fmt.Errorf("%w: a sequenced swap whose legs share %x is "+
+				"hash-linked and must say so", ErrRecord, r.Hash)
+		}
+		if r.Preimage == zeroPre {
+			// There is no later moment at which it arrives: the outgoing
+			// leg's preimage settles nothing here. Accepting money against
+			// a claim that can never be made is the one thing this check
+			// exists to stop.
+			return fmt.Errorf("%w: a sequenced swap must hold the incoming "+
+				"preimage before it accepts money, and this one has none",
+				ErrRecord)
+		}
+	}
+
 	return nil
+}
+
+// Outgoing is the payment hash of the outgoing leg, which for a hash-linked
+// swap is the incoming one.
+func (r Record) Outgoing() node.Hash {
+	var zero node.Hash
+	if r.OutgoingHash == zero {
+		return r.Hash
+	}
+
+	return r.OutgoingHash
 }
 
 // Store is the durable record. Put must not return until the record would

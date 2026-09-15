@@ -239,14 +239,14 @@ func (d *Driver) Resume(ctx context.Context, sw *Swap) (swap.Event, bool, error)
 func (d *Driver) resumePaying(ctx context.Context, sw *Swap) (swap.Event, bool,
 	error) {
 
-	pmt, err := d.Out.LookupPayment(ctx, sw.Hash)
+	pmt, err := d.Out.LookupPayment(ctx, sw.Outgoing())
 	if err != nil {
 		return 0, false, fmt.Errorf("reading the outgoing payment: %w", err)
 	}
 
 	switch pmt.State {
 	case node.PaymentSucceeded:
-		sw.Preimage = pmt.Preimage
+		recordOutgoing(sw, pmt.Preimage)
 
 		return swap.OutgoingSucceeded, true, nil
 
@@ -316,6 +316,22 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 		return d.In.CancelInvoice(ctx, sw.Hash)
 
 	case swap.SettleIncoming:
+		// Only ever out of Paid, which is only reachable from Paying by the
+		// outgoing leg definitively succeeding.
+		//
+		// For a hash-linked swap this is belt and braces: the bridge does
+		// not hold a usable preimage before then, so an early settle would
+		// fail at the node anyway. **For a sequenced swap it is the whole
+		// protection.** There the incoming preimage was chosen before any
+		// money moved, so the bridge could settle whenever it liked, and the
+		// recipient's guarantee that they are paid first rests on this
+		// check and the state machine behind it rather than on arithmetic.
+		if sw.State != swap.Paid {
+			return fmt.Errorf("%w: refusing to settle from %v; the incoming "+
+				"leg is claimed only after the outgoing one has succeeded",
+				ErrState, sw.State)
+		}
+
 		var zero node.Preimage
 		if sw.Preimage == zero {
 			return fmt.Errorf("%w: no preimage to settle with", ErrState)
@@ -382,7 +398,7 @@ func (d *Driver) Pay(ctx context.Context, sw *Swap, req node.PayRequest) (
 
 	switch pmt.State {
 	case node.PaymentSucceeded:
-		sw.Preimage = pmt.Preimage
+		recordOutgoing(sw, pmt.Preimage)
 
 		return swap.OutgoingSucceeded, true, nil
 
@@ -392,5 +408,19 @@ func (d *Driver) Pay(ctx context.Context, sw *Swap, req node.PayRequest) (
 	default:
 		// In flight or unknown. Nothing to conclude.
 		return 0, false, nil
+	}
+}
+
+// recordOutgoing files the preimage the outgoing leg produced.
+//
+// For a hash-linked swap it is also what claims the incoming HTLC, and the
+// swap has been holding nothing until this moment. For a sequenced swap it
+// settles nothing here — the incoming preimage was chosen before any money
+// moved — and overwriting with it would replace a working claim with one the
+// incoming node will reject. It is kept as evidence instead.
+func recordOutgoing(sw *Swap, pre node.Preimage) {
+	sw.OutgoingPreimage = pre
+	if sw.Binding == swap.HashLinked {
+		sw.Preimage = pre
 	}
 }

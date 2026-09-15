@@ -830,3 +830,214 @@ func TestCommittedRefusesToUnderreportOnOverflow(t *testing.T) {
 		t.Errorf("want ErrRecord, got %v", err)
 	}
 }
+
+// TestBindingsThatWouldOverstateTheAssurance. A record that claims the
+// stronger arrangement while describing the weaker one is the most expensive
+// mistake available: everything downstream would trust it more than it earned.
+func TestBindingsThatWouldOverstateTheAssurance(t *testing.T) {
+	pre := node.Preimage{0x11}
+	other := node.Hash{0x99}
+
+	base := func() Record {
+		r := rec(1, swap.Funded)
+		r.Hash = pre.Hash()
+
+		return r
+	}
+
+	for _, c := range []struct {
+		name string
+		with func(r *Record)
+		want string
+	}{
+		{
+			// Sharing a hash is the whole of the hash-linked security. A
+			// record naming a different outgoing hash has no binding at all.
+			"hash-linked while paying a different hash",
+			func(r *Record) {
+				r.Binding = swap.HashLinked
+				r.OutgoingHash = other
+			},
+			"cannot pay",
+		},
+		{
+			"sequenced with no outgoing hash",
+			func(r *Record) {
+				r.Binding = swap.Sequenced
+				r.Preimage = pre
+			},
+			"needs the outgoing hash",
+		},
+		{
+			// Recording the stronger arrangement as the weaker one is
+			// harmless. The reverse is not, so it is refused rather than
+			// quietly corrected.
+			"sequenced whose legs actually share a hash",
+			func(r *Record) {
+				r.Binding = swap.Sequenced
+				r.Preimage = pre
+				r.OutgoingHash = r.Hash
+			},
+			"is hash-linked and must say so",
+		},
+		{
+			// There is no later moment at which it arrives.
+			"sequenced with no preimage to settle with",
+			func(r *Record) {
+				r.Binding = swap.Sequenced
+				r.OutgoingHash = other
+			},
+			"before it accepts money",
+		},
+		{"a binding this build does not have",
+			func(r *Record) { r.Binding = swap.Binding(77) },
+			"unknown swap binding"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := base()
+			c.with(&r)
+			err := r.Valid()
+			if !errors.Is(err, ErrRecord) {
+				t.Fatalf("want ErrRecord, got %v", err)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Errorf("error %q does not mention %q", err, c.want)
+			}
+		})
+	}
+
+	// Both well-formed shapes are accepted.
+	linked := base()
+	if err := linked.Valid(); err != nil {
+		t.Errorf("a hash-linked swap was refused: %v", err)
+	}
+	if got := linked.Outgoing(); got != linked.Hash {
+		t.Errorf("a hash-linked swap pays %x, want its own hash %x", got,
+			linked.Hash)
+	}
+
+	seq := base()
+	seq.Binding = swap.Sequenced
+	seq.Preimage = pre
+	seq.OutgoingHash = other
+	if err := seq.Valid(); err != nil {
+		t.Errorf("a sequenced swap was refused: %v", err)
+	}
+	if got := seq.Outgoing(); got != other {
+		t.Errorf("a sequenced swap pays %x, want %x", got, other)
+	}
+}
+
+// TestTheNewFieldsSurviveTheJournal, and a record written before bindings
+// existed still reads. Old records named no binding, and they are all
+// hash-linked, which is the arrangement that was possible at the time.
+func TestTheNewFieldsSurviveTheJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+	pre := node.Preimage{0x11}
+	outPre := node.Preimage{0x22}
+	// The outgoing hash is the one that preimage settles, because the record
+	// now checks that and a fixture that disagreed was describing a payment
+	// nobody made.
+	outHash := outPre.Hash()
+
+	r := rec(1, swap.Paid)
+	r.Hash = pre.Hash()
+	r.Binding = swap.Sequenced
+	r.Preimage = pre
+	r.OutgoingHash = outHash
+	r.OutgoingPreimage = outPre
+
+	j := open(t, path)
+	if err := j.Put(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	again := open(t, path)
+	got, err := again.Get(ctx, r.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Binding != swap.Sequenced || got.OutgoingHash != outHash ||
+		got.OutgoingPreimage != outPre || got.Preimage != pre {
+
+		t.Errorf("round trip lost something: %+v", got)
+	}
+
+	// A record from before bindings: no binding field at all.
+	old := `{"hash":"` + strings.Repeat("aa", 32) + `","state":"funded",` +
+		`"created":"2026-09-14T12:00:00Z","updated":"2026-09-14T12:00:00Z"}`
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(checksummed(old)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	third, err := Open(path)
+	if err != nil {
+		t.Fatalf("a record from before bindings would not replay: %v", err)
+	}
+	defer third.Close()
+
+	var oldHash node.Hash
+	for i := range oldHash {
+		oldHash[i] = 0xaa
+	}
+	back, err := third.Get(ctx, oldHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Binding != swap.HashLinked {
+		t.Errorf("an old record read as %v, want hash-linked", back.Binding)
+	}
+}
+
+// TestAnOutgoingPreimageForSomeOtherPayment is refused. Evidence nobody checks
+// is not evidence: for a hash-linked swap the incoming check already covers it,
+// but for a sequenced one nothing else would ever catch a node handing back a
+// preimage belonging to a different payment.
+func TestAnOutgoingPreimageForSomeOtherPayment(t *testing.T) {
+	ours := node.Preimage{0x11}
+	theirs := node.Preimage{0x22}
+	stranger := node.Preimage{0x33}
+
+	seq := rec(1, swap.Paid)
+	seq.Hash = ours.Hash()
+	seq.Binding = swap.Sequenced
+	seq.Preimage = ours
+	seq.OutgoingHash = theirs.Hash()
+
+	// The right one is accepted.
+	good := seq
+	good.OutgoingPreimage = theirs
+	if err := good.Valid(); err != nil {
+		t.Errorf("the correct outgoing preimage was refused: %v", err)
+	}
+
+	// One for a different payment is not.
+	bad := seq
+	bad.OutgoingPreimage = stranger
+	err := bad.Valid()
+	if !errors.Is(err, ErrRecord) {
+		t.Fatalf("want ErrRecord, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not the") {
+		t.Errorf("error %q does not say which payment it settles", err)
+	}
+
+	// And the same for a hash-linked swap, where the outgoing preimage is
+	// the incoming one.
+	linked := rec(2, swap.Paid)
+	linked.Hash = ours.Hash()
+	linked.Preimage = ours
+	linked.OutgoingPreimage = stranger
+	if err := linked.Valid(); !errors.Is(err, ErrRecord) {
+		t.Errorf("hash-linked: want ErrRecord, got %v", err)
+	}
+}

@@ -60,6 +60,19 @@ A node that did not answer says nothing about the swap, and abandoning a live
 HTLC over a blip is how one expires; an inconsistency, or anything the bridge
 has said it must not decide alone, must not be repeated at all.
 
+Not every swap can be hash-linked, and `swap.Binding` says which kind each one
+is rather than leaving it to be inferred. A **hash-linked** swap shares one
+payment hash, so the bridge physically cannot claim the incoming funds without
+having delivered — a fact about what it holds, which survives any bug in this
+program. A **sequenced** swap cannot: a payout's outgoing invoice is issued by
+the recipient's node, which chooses its own preimage, so the legs have
+different hashes and the bridge knows the incoming preimage from the start.
+There the protection is the *order*, enforced here rather than by arithmetic:
+the incoming HTLC is held until the outgoing leg has definitively succeeded, so
+the recipient is paid before the bridge collects. What that protects them from
+is failure, not malice — and the code says so where it matters rather than
+letting the two be mistaken for one another.
+
 `quote` never chooses the payment hash. It comes from the invoice the user
 asked to have paid, read by **the node that will pay it** rather than by a
 second parser in this process, because a parser that disagreed by one field

@@ -18,6 +18,7 @@ package bridgetest
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,12 +98,7 @@ func TestLiveSwap(t *testing.T) {
 
 	in := lnd.NewIncoming(lf1Conn)
 	out := lnd.NewOutgoing(shaConn)
-	if err := in.Check(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := out.Check(ctx); err != nil {
-		t.Fatal(err)
-	}
+	checkNodes(t, ctx, in, out)
 
 	// The destination issues the invoice the user wants paid. Its final-hop
 	// delta is set explicitly: lnd's default of 80 would fill the whole
@@ -258,6 +254,7 @@ func TestLiveRefund(t *testing.T) {
 	in := lnd.NewIncoming(lf1Conn)
 	out := lnd.NewOutgoing(shaConn)
 	dest := lnd.NewIncoming(sha2Conn)
+	checkNodes(t, ctx, in, out)
 
 	const payMsat = 120_000
 	sha2 := lnrpc.NewLightningClient(sha2Conn)
@@ -455,5 +452,32 @@ func payHoldInvoice(ctx context.Context, t *testing.T, conn *grpc.ClientConn,
 		case lnrpc.Payment_FAILED:
 			return errUserPaymentFailed{update.GetFailureReason()}
 		}
+	}
+}
+
+// checkNodes refuses to start against a node that is not caught up, and says
+// what to do about it.
+//
+// An idle regtest goes unsynced on its own: lnd judges by the age of the best
+// block, so a chain nobody is mining drifts out of sync without falling
+// behind. That is the lab, not the bridge — on a live chain the same check is
+// what stops a swap being sized against a height that is not the present one.
+func checkNodes(t *testing.T, ctx context.Context, in *lnd.Incoming,
+	out *lnd.Outgoing) {
+
+	t.Helper()
+
+	for name, err := range map[string]error{
+		"incoming": in.Check(ctx), "outgoing": out.Check(ctx),
+	} {
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, lnd.ErrNotSynced) {
+			t.Fatalf("the %s node is not caught up, which an idle regtest "+
+				"does on its own: run `make bridge-setup` in the lab, which "+
+				"mines on both chains, and try again. (%v)", name, err)
+		}
+		t.Fatalf("the %s node: %v", name, err)
 	}
 }

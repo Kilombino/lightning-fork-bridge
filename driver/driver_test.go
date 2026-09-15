@@ -58,6 +58,12 @@ type fakeOut struct {
 	lookup    node.Payment
 	lookupErr error
 	paid      int
+
+	// lookups answers for specific hashes, consulted before lookup. A
+	// sequenced swap's two legs have different hashes, so a fake that
+	// answered the same for any hash could not show that the driver asks
+	// about the right one.
+	lookups map[node.Hash]node.Payment
 }
 
 func (f *fakeOut) Pay(context.Context, node.PayRequest) (node.Payment, error) {
@@ -69,7 +75,13 @@ func (f *fakeOut) Pay(context.Context, node.PayRequest) (node.Payment, error) {
 	return f.payment, nil
 }
 
-func (f *fakeOut) LookupPayment(context.Context, node.Hash) (node.Payment, error) {
+func (f *fakeOut) LookupPayment(_ context.Context, hash node.Hash) (
+	node.Payment, error) {
+
+	if p, ok := f.lookups[hash]; ok {
+		return p, nil
+	}
+
 	return f.lookup, f.lookupErr
 }
 
