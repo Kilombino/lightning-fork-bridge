@@ -8,6 +8,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +57,8 @@ func (f *fakeIn) BlockHeight(context.Context) (int32, error)         { return 50
 func quotableService(t *testing.T) *Service {
 	t.Helper()
 
-	j := openJournal(t, t.TempDir())
+	dir := t.TempDir()
+	j := openJournal(t, dir)
 	t.Cleanup(func() { j.Close() })
 
 	out := &fakeOut{
@@ -70,11 +73,19 @@ func quotableService(t *testing.T) *Service {
 		},
 	}
 
-	s := &Service{log: quiet(), ctx: context.Background(), journal: j}
+	s := &Service{
+		log: quiet(), ctx: context.Background(), journal: j,
+		cfg: Config{Journal: filepath.Join(dir, "swaps.journal")},
+	}
 	s.price = rate.Reading{
 		OutgoingPerIncoming: 0.00308078, At: time.Now(), Sources: 2,
 		Spread: 0.01,
 	}
+	oracle, err := rate.New(rate.DefaultPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.oracle = oracle
 	s.lfChain = observerAt(t, 155*time.Second)
 	s.btcChain = observerAt(t, 600*time.Second)
 
@@ -459,5 +470,31 @@ func TestCloseReportsEveryFailure(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the error should mention %q: %v", want, err)
 		}
+	}
+}
+
+// A journal that has gone means every quote fails, so health has to say so
+// rather than reporting a bridge that is up and useless.
+func TestHealthReportsAMissingJournal(t *testing.T) {
+	t.Parallel()
+
+	s := quotableService(t)
+	s.priceErr = nil
+
+	// A volume that went away under a running daemon, which is the failure
+	// this actually catches.
+	if err := os.Remove(s.cfg.Journal); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, wanted 503: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"journal"`) {
+		t.Errorf("health should name the journal: %s", w.Body.String())
 	}
 }

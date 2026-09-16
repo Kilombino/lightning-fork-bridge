@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/paulscode/lightning-fork-bridge/node"
@@ -231,6 +232,25 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 			ready = false
 		} else {
 			out[sd.name] = "ok"
+		}
+	}
+
+	// Every quote writes to the journal, so a bridge whose journal has gone
+	// is up and unable to do anything.
+	//
+	// This checks the file is still there, which catches the operational
+	// failure that actually happens: a deleted file, or a volume that went
+	// away under a running daemon. It does not catch a full disk, because
+	// the only way to learn that is to write, and health checks that write
+	// to the record a swap depends on are their own hazard. Reading the
+	// journal would catch neither: Pending answers from an in-memory index
+	// and never touches disk.
+	if s.cfg.Journal != "" {
+		if _, err := os.Stat(s.cfg.Journal); err != nil {
+			out["journal"] = err.Error()
+			ready = false
+		} else {
+			out["journal"] = "present"
 		}
 	}
 

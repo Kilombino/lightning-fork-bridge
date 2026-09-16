@@ -144,6 +144,12 @@ type Config struct {
 	// PollInterval is how often the chain and price observers refresh.
 	// Zero means thirty seconds.
 	PollInterval time.Duration `json:"pollInterval,omitempty"`
+
+	// CompactInterval is how often the journal is rewritten without the
+	// swaps that have finished. Zero means an hour. The journal is
+	// append-only, so without this it grows for as long as the daemon runs
+	// and is replayed in full at every start.
+	CompactInterval time.Duration `json:"compactInterval,omitempty"`
 }
 
 // RateSource is one place to read the price from.
@@ -331,6 +337,15 @@ func (d Direction) valid(which string) error {
 	}
 
 	return nil
+}
+
+// compactInterval is how often to rewrite the journal.
+func (c Config) compactInterval() time.Duration {
+	if c.CompactInterval <= 0 {
+		return DefaultCompactInterval
+	}
+
+	return c.CompactInterval
 }
 
 // pollInterval is how often to refresh the observers.

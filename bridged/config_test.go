@@ -2,6 +2,8 @@ package bridged
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -211,5 +213,71 @@ func TestExtractReadsNumbersAndStrings(t *testing.T) {
 		if err == nil {
 			t.Errorf("%s: wanted an error, got %v", test.path, got)
 		}
+	}
+}
+
+func TestLoadFileReadsAConfiguration(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("the reference configuration should load from a file: %v",
+			err)
+	}
+	if cfg.Listen != "127.0.0.1:9737" {
+		t.Errorf("listen %q", cfg.Listen)
+	}
+
+	if _, err := LoadFile(filepath.Join(t.TempDir(), "absent.json")); err == nil {
+		t.Error("a missing file should be an error")
+	} else if !errors.Is(err, ErrConfig) {
+		t.Errorf("wanted ErrConfig, got %v", err)
+	}
+}
+
+func TestIntervalsDefaultWhenUnset(t *testing.T) {
+	t.Parallel()
+
+	var c Config
+	if c.pollInterval() != 30*time.Second {
+		t.Errorf("poll interval %v", c.pollInterval())
+	}
+	if c.compactInterval() != DefaultCompactInterval {
+		t.Errorf("compact interval %v", c.compactInterval())
+	}
+
+	c.PollInterval = time.Minute
+	c.CompactInterval = 2 * time.Hour
+	if c.pollInterval() != time.Minute {
+		t.Errorf("configured poll interval was ignored: %v", c.pollInterval())
+	}
+	if c.compactInterval() != 2*time.Hour {
+		t.Errorf("configured compact interval was ignored: %v",
+			c.compactInterval())
+	}
+}
+
+// The node details have to reach the dialler intact: a macaroon that did not
+// arrive is a connection that fails at the worst moment rather than at start.
+func TestNodeDetailsReachTheDialler(t *testing.T) {
+	t.Parallel()
+
+	n := Node{
+		Address: "host:10009", TLSCertPath: "/tls.cert",
+		MacaroonPath: "/admin.macaroon", ServerName: "lf1",
+		Timeout: 5 * time.Second,
+	}
+	got := n.toLND()
+
+	if got.Address != n.Address || got.TLSCertPath != n.TLSCertPath ||
+		got.MacaroonPath != n.MacaroonPath ||
+		got.ServerName != n.ServerName || got.Timeout != n.Timeout {
+
+		t.Errorf("the dialler config does not match: %+v against %+v", got, n)
 	}
 }

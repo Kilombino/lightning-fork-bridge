@@ -444,3 +444,19 @@ func inventoryForTest() inventory.Policy {
 
 	return p
 }
+
+// emptyObserver has seen no blocks, so it cannot estimate.
+func emptyObserver(t *testing.T) *chainrate.Observer {
+	t.Helper()
+
+	obs, err := chainrate.New(chainrate.Params{
+		RetargetInterval: 2016, TargetSpacing: 10 * time.Minute,
+		SurgeFactor: 2, StallFactor: 2, MinSamples: 6,
+		StaleAfter: 24 * time.Hour, SurgeWindow: 12,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return obs
+}

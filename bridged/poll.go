@@ -42,6 +42,17 @@ func (s *Service) pollChains(ctx context.Context) {
 func (s *Service) sampleChain(ctx context.Context, conn *grpc.ClientConn,
 	obs *chainrate.Observer, which string) {
 
+	// A poller that panics takes the daemon down with it, including any
+	// swap holding an HTLC, and it would do that for a reason unrelated to
+	// the swap. New always sets both connections, so this is a programming
+	// error rather than an operational one, but it should not be a fatal
+	// one from a background goroutine.
+	if conn == nil {
+		s.log.Warn("no connection to sample from", "chain", which)
+
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
@@ -92,6 +103,15 @@ func (s *Service) pollPrice(ctx context.Context) {
 // with everything defeats it. If that leaves too few, the oracle refuses and
 // the refusal is what quotes see.
 func (s *Service) samplePrice(ctx context.Context) {
+	// Same reasoning as sampleChain: New always builds the oracle, so a
+	// missing one is a programming error, and a background goroutine is
+	// the wrong place to turn one into a dead daemon.
+	if s.oracle == nil {
+		s.log.Warn("no rate oracle to price with")
+
+		return
+	}
+
 	obs := make([]rate.Observation, 0, len(s.cfg.RateSources))
 	for _, src := range s.cfg.RateSources {
 		price, err := fetchPrice(ctx, src)

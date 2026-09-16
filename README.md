@@ -133,8 +133,14 @@ has shown, while keeping an outgoing budget that suits ordinary destinations,
 does exactly that. The daemon checks the combination at startup rather than
 letting it surface as a refusal on the first quote.
 
+The journal is append-only, so the daemon rewrites it without the swaps that
+have finished, hourly by default and only while nothing is being driven:
+compaction takes the journal's lock, and a swap blocked on writing its own
+state is a swap that is not watching an HTLC. Without that it grows for as long
+as the daemon runs and is replayed in full at every start.
+
 `GET /health` answers 503 when there is no usable price, a chain it cannot
-measure, or a node it cannot reach. A bridge in any of those states is up and
+measure, a node it cannot reach, or a journal that has gone. A bridge in any of those states is up and
 unable to do anything, and reporting "ok" is how that goes unnoticed.
 
 ## Status

@@ -98,5 +98,6 @@
       "Curve": 1,
       "MaxAge": 300000000000
     }
-  }
+  },
+  "compactInterval": 3600000000000
 }

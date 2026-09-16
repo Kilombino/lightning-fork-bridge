@@ -9,21 +9,47 @@ import (
 	"time"
 )
 
+// DefaultCompactInterval is how often the journal is rewritten without the
+// swaps that have finished.
+const DefaultCompactInterval = time.Hour
+
 // Run starts the daemon and blocks until ctx ends or the listener fails.
 //
 // The order matters. Pending swaps are resumed before the surface opens, so a
 // swap interrupted by the last shutdown is being driven again before any new
 // one can be quoted: an HTLC that is already locked in has a deadline, and a
 // new quote can wait.
+//
+// However it ends, the swaps being driven are stopped and waited for before
+// this returns. The caller's next move is Close, which shuts the node
+// connections those swaps are talking over, and the error paths used to skip
+// the wait: resume starts driving before the listener is opened, so a failure
+// to listen would have pulled the connections out from under them.
 func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctxOrBackground(ctx))
-	defer cancel()
 	s.setDriveCtx(ctx)
 
+	err := s.serve(ctx)
+
+	// Unconditional, and deliberately not a defer: the cancel has to happen
+	// before the wait, or the swaps would be waited on while still running,
+	// and defer ordering is an easy thing to get backwards later.
+	cancel()
+	if n := s.active(); n > 0 {
+		s.log.Info("waiting for swaps in flight", "swaps", n)
+	}
+	s.wg.Wait()
+
+	return err
+}
+
+// serve is everything between the observers starting and the surface closing.
+func (s *Service) serve(ctx context.Context) error {
 	// Observers first, and a moment to fill: a resumed swap is sized
 	// against block spacing, and an observer with nothing in it refuses.
 	go s.pollChains(ctx)
 	go s.pollPrice(ctx)
+	go s.compact(ctx)
 
 	if err := s.waitForChains(ctx); err != nil {
 		return err
@@ -44,6 +70,10 @@ func (s *Service) Run(ctx context.Context) error {
 	srv := &http.Server{
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A quote waits on two Lightning nodes, so the read and write
+		// timeouts are left off deliberately; the handler bounds itself.
+		// Idle connections are not left to accumulate.
+		IdleTimeout: 2 * time.Minute,
 	}
 
 	s.log.Info("bridge is up", "listen", ln.Addr().String(),
@@ -62,15 +92,12 @@ func (s *Service) Run(ctx context.Context) error {
 	case <-ctx.Done():
 	}
 
-	// Stop accepting, then let the swaps in flight finish. A swap holds an
-	// HTLC on someone's channel; dropping it to exit a second sooner is how
-	// one expires.
+	// Stop accepting before the caller stops driving, so no new swap is
+	// quoted into a daemon on its way out. Shutdown waits for the handlers
+	// already running, which is what makes the wait afterwards complete.
 	shutdown, done := context.WithTimeout(context.Background(), 30*time.Second)
 	defer done()
 	_ = srv.Shutdown(shutdown)
-
-	s.log.Info("waiting for swaps in flight", "swaps", s.active())
-	s.wg.Wait()
 
 	return nil
 }
@@ -79,10 +106,52 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) active() int {
 	var n int
 	for _, sd := range s.sides {
+		if sd.runner == nil {
+			continue
+		}
 		n += sd.runner.Active()
 	}
 
 	return n
+}
+
+// compact rewrites the journal without the swaps that have finished, until
+// ctx ends.
+//
+// The journal is append-only, so every state a swap passes through is another
+// line, and a daemon that runs for months replays all of them at startup.
+// Nothing else calls this, which is why it belongs here rather than in an
+// operator's memory.
+func (s *Service) compact(ctx context.Context) {
+	if s.journal == nil {
+		return
+	}
+
+	tick := time.NewTicker(s.cfg.compactInterval())
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		// Not while swaps are being driven. Compaction takes the journal's
+		// lock, and a swap blocked on writing its own state is a swap that
+		// is not watching an HTLC.
+		if n := s.active(); n > 0 {
+			s.log.Debug("not compacting yet", "swaps", n)
+
+			continue
+		}
+		if err := s.journal.Compact(ctx); err != nil {
+			s.log.Warn("could not compact the journal", "err", err)
+
+			continue
+		}
+		s.log.Info("compacted the journal")
+	}
 }
 
 // waitForChains blocks until both observers can estimate, or ctx ends.
@@ -93,6 +162,11 @@ func (s *Service) active() int {
 func (s *Service) waitForChains(ctx context.Context) error {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+
+	// Waiting in silence looks the same as being hung, and this runs before
+	// the surface opens, so there is nothing to ask. Say so periodically.
+	say := time.NewTicker(15 * time.Second)
+	defer say.Stop()
 
 	var last error
 	for {
@@ -107,6 +181,9 @@ func (s *Service) waitForChains(ctx context.Context) error {
 		case <-ctx.Done():
 			return fmt.Errorf("gave up waiting for both chains to be "+
 				"measurable: %w", last)
+		case <-say.C:
+			s.log.Info("waiting for both chains to be measurable, which "+
+				"takes a few blocks from each", "why", last)
 		case <-tick.C:
 		}
 	}
