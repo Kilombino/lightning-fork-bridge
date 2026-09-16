@@ -44,15 +44,24 @@ var (
 	ErrPolicy = errors.New("price policy is not usable")
 )
 
-// Observation is one source's reading of what a BTCB2 is worth in BTC.
+// Observation is one source's reading of the pair, in the direction the swap
+// runs.
 type Observation struct {
 	// Source names where it came from, for logs and for saying which pair
 	// disagreed.
 	Source string
 
-	// BTCPerBTCB2 is the price of one BTCB2 in BTC, the direction the
-	// venue's own BTCB2_BTC pair quotes. On 2026-09-14 it was 0.00308078.
-	BTCPerBTCB2 float64
+	// OutgoingPerIncoming is how many outgoing units one incoming unit buys,
+	// which is what the quote divides by. Named for the legs rather than for
+	// the assets because the bridge runs in both directions and the two are
+	// reciprocals: a bridge taking BTCB2 and paying BTC uses the venue's own
+	// BTCB2_BTC price, 0.00308078 on 2026-09-14, and one taking BTC and
+	// paying BTCB2 uses its inverse.
+	//
+	// The old name said BTCPerBTCB2, which was true of one direction and a
+	// lie in the other, and the formula it feeds does not care which asset
+	// is which.
+	OutgoingPerIncoming float64
 
 	// At is when the reading was taken, not when it was received.
 	At time.Time
@@ -60,8 +69,8 @@ type Observation struct {
 
 // Valid reports whether an observation can be used.
 func (o Observation) Valid() bool {
-	return o.BTCPerBTCB2 > 0 && !math.IsInf(o.BTCPerBTCB2, 0) &&
-		!math.IsNaN(o.BTCPerBTCB2) && !o.At.IsZero()
+	return o.OutgoingPerIncoming > 0 && !math.IsInf(o.OutgoingPerIncoming, 0) &&
+		!math.IsNaN(o.OutgoingPerIncoming) && !o.At.IsZero()
 }
 
 // Policy is how careful to be.
@@ -123,8 +132,8 @@ func (p Policy) Valid() bool {
 
 // Reading is what the oracle concluded.
 type Reading struct {
-	// BTCPerBTCB2 is the price to quote from.
-	BTCPerBTCB2 float64
+	// OutgoingPerIncoming is the price to quote from.
+	OutgoingPerIncoming float64
 
 	// At is the moment it describes.
 	At time.Time
@@ -199,13 +208,13 @@ func combine(obs []Observation, p Policy, now time.Time) (float64, int, error) {
 	for i := 0; i < len(fresh); i++ {
 		for j := i + 1; j < len(fresh); j++ {
 			a, b := fresh[i], fresh[j]
-			gap := math.Abs(a.BTCPerBTCB2-b.BTCPerBTCB2) /
-				math.Min(a.BTCPerBTCB2, b.BTCPerBTCB2)
+			gap := math.Abs(a.OutgoingPerIncoming-b.OutgoingPerIncoming) /
+				math.Min(a.OutgoingPerIncoming, b.OutgoingPerIncoming)
 			if gap > p.MaxDisagreement {
 				return 0, 0, fmt.Errorf("%w: %s says %g, %s says %g, "+
 					"a gap of %.1f%% against a limit of %.1f%%",
-					ErrDisagreement, a.Source, a.BTCPerBTCB2,
-					b.Source, b.BTCPerBTCB2, gap*100,
+					ErrDisagreement, a.Source, a.OutgoingPerIncoming,
+					b.Source, b.OutgoingPerIncoming, gap*100,
 					p.MaxDisagreement*100)
 			}
 		}
@@ -215,7 +224,7 @@ func combine(obs []Observation, p Policy, now time.Time) (float64, int, error) {
 	// source drifting.
 	prices := make([]float64, len(fresh))
 	for i, o := range fresh {
-		prices[i] = o.BTCPerBTCB2
+		prices[i] = o.OutgoingPerIncoming
 	}
 	sort.Float64s(prices)
 
@@ -229,8 +238,8 @@ func (o *Oracle) volatility(price float64, now time.Time, p Policy) float64 {
 		if now.Sub(r.At) > p.BreakerWindow {
 			continue
 		}
-		lo = math.Min(lo, r.BTCPerBTCB2)
-		hi = math.Max(hi, r.BTCPerBTCB2)
+		lo = math.Min(lo, r.OutgoingPerIncoming)
+		hi = math.Max(hi, r.OutgoingPerIncoming)
 	}
 	if lo <= 0 {
 		return 0
@@ -265,11 +274,11 @@ func (o *Oracle) Update(now time.Time, obs []Observation) (Reading, error) {
 	}
 
 	r := Reading{
-		BTCPerBTCB2: price,
-		At:          now,
-		Sources:     sources,
-		Spread:      spread,
-		Volatility:  vol,
+		OutgoingPerIncoming: price,
+		At:                  now,
+		Sources:             sources,
+		Spread:              spread,
+		Volatility:          vol,
 	}
 
 	// Keep only what the breaker window needs, in place: this runs on every
@@ -306,8 +315,8 @@ func Derive(source string, btcb2USD, btcUSD float64, at time.Time) (Observation,
 	}
 
 	return Observation{
-		Source:      source,
-		BTCPerBTCB2: btcb2USD / btcUSD,
-		At:          at,
+		Source:              source,
+		OutgoingPerIncoming: btcb2USD / btcUSD,
+		At:                  at,
 	}, nil
 }

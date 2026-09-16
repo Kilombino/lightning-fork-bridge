@@ -10,7 +10,7 @@ import (
 var now = time.Unix(1_700_000_000, 0)
 
 func obs(source string, price float64, at time.Time) Observation {
-	return Observation{Source: source, BTCPerBTCB2: price, At: at}
+	return Observation{Source: source, OutgoingPerIncoming: price, At: at}
 }
 
 // TestTheRealCrossCheck uses the figures measured on 2026-09-14. The venue's
@@ -27,7 +27,7 @@ func TestTheRealCrossCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	gap := math.Abs(derived.BTCPerBTCB2-directBTC) / directBTC
+	gap := math.Abs(derived.OutgoingPerIncoming-directBTC) / directBTC
 	if gap > 0.01 {
 		t.Fatalf("the two readings differ by %.2f%%; the design document "+
 			"claims under one percent", gap*100)
@@ -46,8 +46,8 @@ func TestTheRealCrossCheck(t *testing.T) {
 	if r.Sources != 2 {
 		t.Errorf("used %d sources, want 2", r.Sources)
 	}
-	if r.BTCPerBTCB2 < directBTC*0.99 || r.BTCPerBTCB2 > directBTC*1.01 {
-		t.Errorf("combined to %g, want about %g", r.BTCPerBTCB2, directBTC)
+	if r.OutgoingPerIncoming < directBTC*0.99 || r.OutgoingPerIncoming > directBTC*1.01 {
+		t.Errorf("combined to %g, want about %g", r.OutgoingPerIncoming, directBTC)
 	}
 }
 
@@ -89,8 +89,8 @@ func TestStaleObservationsAreDropped(t *testing.T) {
 	if r.Sources != 1 {
 		t.Errorf("used %d sources, want 1", r.Sources)
 	}
-	if r.BTCPerBTCB2 != 0.00308 {
-		t.Errorf("got %g, want the fresh reading", r.BTCPerBTCB2)
+	if r.OutgoingPerIncoming != 0.00308 {
+		t.Errorf("got %g, want the fresh reading", r.OutgoingPerIncoming)
 	}
 
 	// Everything stale is a refusal, not a guess.
@@ -259,11 +259,11 @@ func TestRejectsBadInput(t *testing.T) {
 	o, _ := New(DefaultPolicy)
 
 	for _, bad := range []Observation{
-		{Source: "zero", BTCPerBTCB2: 0, At: now},
-		{Source: "negative", BTCPerBTCB2: -1, At: now},
-		{Source: "nan", BTCPerBTCB2: math.NaN(), At: now},
-		{Source: "inf", BTCPerBTCB2: math.Inf(1), At: now},
-		{Source: "no time", BTCPerBTCB2: 0.003},
+		{Source: "zero", OutgoingPerIncoming: 0, At: now},
+		{Source: "negative", OutgoingPerIncoming: -1, At: now},
+		{Source: "nan", OutgoingPerIncoming: math.NaN(), At: now},
+		{Source: "inf", OutgoingPerIncoming: math.Inf(1), At: now},
+		{Source: "no time", OutgoingPerIncoming: 0.003},
 	} {
 		if _, err := o.Update(now, []Observation{bad}); !errors.Is(err, ErrObservation) {
 			t.Errorf("%s: want ErrObservation, got %v", bad.Source, err)
@@ -342,8 +342,8 @@ func TestThreeSourcesTakeTheMedian(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.BTCPerBTCB2 != 0.00305 {
-		t.Errorf("got %g, want the median 0.00305", r.BTCPerBTCB2)
+	if r.OutgoingPerIncoming != 0.00305 {
+		t.Errorf("got %g, want the median 0.00305", r.OutgoingPerIncoming)
 	}
 }
 

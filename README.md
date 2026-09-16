@@ -101,13 +101,32 @@ Built and tested: the logic that decides, the record it decides against, the
 adapters to real nodes, the loop that drives a swap to completion, the quote
 surface that creates one, and the pricing that decides what it costs.
 
-**A swap has run end to end across two chains.** `bridgetest` drives the whole
-stack against the lab's four nodes — a user on the BLAKE2b chain paying a
-Bitcoin invoice, with real hold invoices, real HTLCs and a real journal on
-disk. Both halves are covered: the settlement, and the refund when the outgoing
-leg cannot be delivered.
+**Swaps have run end to end across two chains, in both directions.**
+`bridgetest` drives the whole stack against the lab's four nodes, with real
+hold invoices, real HTLCs and a real journal on disk:
 
-Not built: the payout adapter, and the daemon that wires this behind a
+| Test | What runs |
+| --- | --- |
+| `TestLiveSwap` | a user on the BLAKE2b chain pays a Bitcoin invoice |
+| `TestLiveReverseSwap` | a user on Bitcoin pays a BLAKE2b invoice |
+| `TestLiveRefund` | the outgoing leg cannot be delivered, and the user is refunded |
+
+The reverse direction needed no change to `quote`, `driver`, `runner` or
+`store`. Those take their nodes and their rate as collaborators, so it is the
+same machinery with the two nodes exchanged and the rate inverted. What did
+change is that the rate is named `OutgoingPerIncoming` rather than for the two
+assets, because the formula it feeds does not care which asset is which and the
+old name was true in one direction and false in the other.
+
+That matters for more than symmetry. `inventory` prices the spread off how
+drained the outgoing side is, and calls the flow that puts it back
+*replenishing*; its comments reach for mining payouts as the example, which made
+the replenishing flow look like it depended on a mining integration. It does
+not. An ordinary payment in the other direction is hash-linked exactly like the
+forward one, needs no payout adapter, and replenishes just as well.
+
+Not built: the payout adapter, which is the **sequenced** binding for a payer
+that issues its own invoice, and the daemon that wires this behind a
 configuration file. Nothing has run against mainnet.
 
 Nothing here has moved money. The order was deliberate: the parts that lose

@@ -86,7 +86,7 @@ func decoded() node.Decoded {
 
 func reading(spread float64) rate.Reading {
 	return rate.Reading{
-		BTCPerBTCB2: 0.00308078, At: now, Sources: 2, Spread: spread,
+		OutgoingPerIncoming: 0.00308078, At: now, Sources: 2, Spread: spread,
 	}
 }
 
@@ -426,7 +426,7 @@ func TestNothingIsQuotedWithoutAFreshMeasurement(t *testing.T) {
 		{"a rate of zero", func(q *Quoter) {
 			q.Price = func(context.Context) (rate.Reading, error) {
 				r := reading(0.01)
-				r.BTCPerBTCB2 = 0
+				r.OutgoingPerIncoming = 0
 
 				return r, nil
 			}

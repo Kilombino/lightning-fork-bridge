@@ -370,11 +370,11 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 
 // price works out what the payer owes.
 func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
-	if r.BTCPerBTCB2 <= 0 || math.IsNaN(r.BTCPerBTCB2) ||
-		math.IsInf(r.BTCPerBTCB2, 0) {
+	if r.OutgoingPerIncoming <= 0 || math.IsNaN(r.OutgoingPerIncoming) ||
+		math.IsInf(r.OutgoingPerIncoming, 0) {
 
 		return Quote{}, fmt.Errorf("%w: unusable rate %g", ErrRefused,
-			r.BTCPerBTCB2)
+			r.OutgoingPerIncoming)
 	}
 	if r.Spread < 0 || r.Spread >= 1 {
 		return Quote{}, fmt.Errorf("%w: unusable spread %g", ErrRefused,
@@ -397,12 +397,12 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 	// millisatoshi on average per swap, which is nothing once and a
 	// systematic leak across every swap the bridge ever does, in the one
 	// direction that never corrects.
-	exact := float64(dec.AmountMsat) / r.BTCPerBTCB2 * (1 + r.Spread)
+	exact := float64(dec.AmountMsat) / r.OutgoingPerIncoming * (1 + r.Spread)
 	if math.IsInf(exact, 0) || math.IsNaN(exact) ||
 		exact >= math.MaxUint64/2 {
 
 		return Quote{}, fmt.Errorf("%w: %d msat at %g does not produce a "+
-			"usable amount", ErrRefused, dec.AmountMsat, r.BTCPerBTCB2)
+			"usable amount", ErrRefused, dec.AmountMsat, r.OutgoingPerIncoming)
 	}
 	incoming := uint64(math.Ceil(exact))
 	if incoming == 0 {
@@ -416,7 +416,7 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 		Hash:         dec.Hash,
 		IncomingMsat: incoming,
 		OutgoingMsat: dec.AmountMsat,
-		Rate:         r.BTCPerBTCB2,
+		Rate:         r.OutgoingPerIncoming,
 		Spread:       r.Spread,
 		MaxFeeMsat:   fee,
 		Description:  dec.Description,

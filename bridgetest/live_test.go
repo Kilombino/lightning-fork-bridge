@@ -397,7 +397,7 @@ func labQuoter(t *testing.T, in *lnd.Incoming, out *lnd.Outgoing,
 			}
 
 			return rate.Reading{
-				BTCPerBTCB2: labRate, At: time.Now(), Sources: 1,
+				OutgoingPerIncoming: labRate, At: time.Now(), Sources: 1,
 				Spread: spread.Spread,
 			}, nil
 		},
@@ -480,4 +480,229 @@ func checkNodes(t *testing.T, ctx context.Context, in *lnd.Incoming,
 		}
 		t.Fatalf("the %s node: %v", name, err)
 	}
+}
+
+// labRatesReverse is labRates with the legs swapped: the incoming chain is
+// Bitcoin and the outgoing one is BLAKE2b. Sizing a swap needs each chain's
+// own spacing against the leg it is actually on, and this direction is the
+// easier of the two for it: the outgoing leg resolves on the fast chain, so
+// the incoming CLTV it demands of Bitcoin is small.
+func labRatesReverse(context.Context) (driver.Rates, error) {
+	return driver.Rates{
+		Incoming: margin.Bounds{
+			Fast: 300 * time.Second, Slow: 600 * time.Second,
+		},
+		Outgoing: margin.Bounds{
+			Fast: 155 * time.Second, Slow: 1200 * time.Second,
+		},
+		As: time.Now(),
+	}, nil
+}
+
+// labQuoterReverse is labQuoter for a bridge taking BTC and paying BTCB2.
+//
+// Nothing in quote, driver, runner or store changes to run this way. The
+// quoter takes its nodes and its rate as collaborators, so the reverse
+// direction is the same machinery with the two nodes exchanged and the rate
+// inverted. That is the whole of it, and it is why the rate is named for the
+// legs rather than for the assets.
+func labQuoterReverse(t *testing.T, in *lnd.Incoming, out *lnd.Outgoing,
+	lfConn *grpc.ClientConn, journal *store.Journal) *quote.Quoter {
+
+	t.Helper()
+
+	// The outgoing side is now the BLAKE2b node, so that is the balance the
+	// bridge is spending and the one the spread must respond to.
+	balance := func(ctx context.Context) (uint64, error) {
+		bal, err := lnrpc.NewLightningClient(lfConn).ChannelBalance(ctx,
+			&lnrpc.ChannelBalanceRequest{})
+		if err != nil {
+			return 0, err
+		}
+
+		return uint64(bal.GetLocalBalance().GetMsat()), nil
+	}
+
+	return &quote.Quoter{
+		In: in, Out: out, Store: journal,
+		Price: func(ctx context.Context) (rate.Reading, error) {
+			held, err := balance(ctx)
+			if err != nil {
+				return rate.Reading{}, err
+			}
+			p := inventory.DefaultPolicy
+			p.TargetOutgoingMsat = held
+			p.FloorOutgoingMsat = held / 10
+
+			// Replenishing: this direction brings in the asset the
+			// draining direction spends, which is the flow the
+			// inventory model wants and does not need a miner to
+			// produce.
+			spread, err := p.Spread(inventory.State{
+				OutgoingMsat: held, At: time.Now(),
+			}, inventory.Replenishing, time.Now())
+			if err != nil {
+				return rate.Reading{}, err
+			}
+
+			return rate.Reading{
+				OutgoingPerIncoming: 1 / labRate, At: time.Now(),
+				Sources: 1, Spread: spread.Spread,
+			}, nil
+		},
+		Spacing: labRatesReverse,
+		Room: func(ctx context.Context) (uint64, error) {
+			held, err := balance(ctx)
+			if err != nil {
+				return 0, err
+			}
+			committed, err := store.Committed(ctx, journal)
+			if err != nil {
+				return 0, err
+			}
+			if held < committed {
+				return 0, nil
+			}
+
+			return held - committed, nil
+		},
+		Margin: labMargin,
+		Policy: quote.Policy{
+			MinSwapMsat: 1_000, MaxSwapMsat: 500_000_000,
+			Validity: 2 * time.Minute, InvoiceExpiry: 10 * time.Minute,
+			OutgoingCLTVLimit: 80, FeeFraction: 0.003,
+			MinRemainingLife: 2 * time.Minute,
+		},
+	}
+}
+
+// TestLiveReverseSwap is the other direction: someone on Bitcoin's Lightning
+// network paying a BLAKE2b invoice.
+//
+// The forward direction has been the one under test because it is the one
+// users asked for. This one matters for a second reason: it is the flow that
+// puts back what the forward direction spends. The inventory model calls that
+// replenishing and its comments reach for mining payouts as the example, which
+// made the reverse flow look like it depended on a mining integration. It does
+// not. An ordinary payment in the other direction is hash-linked exactly like
+// the forward one, and replenishes just as well.
+func TestLiveReverseSwap(t *testing.T) {
+	dir := lab(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	var (
+		shaConn  = dial(t, dir, "lnd-sha")  // bridge receives here, on Bitcoin
+		sha2Conn = dial(t, dir, "lnd-sha2") // the user, on Bitcoin
+		lf1Conn  = dial(t, dir, "lf1")      // bridge pays from here, on BLAKE2b
+		lf2Conn  = dial(t, dir, "lf2")      // the destination, on BLAKE2b
+	)
+
+	in := lnd.NewIncoming(shaConn)
+	out := lnd.NewOutgoing(lf1Conn)
+	checkNodes(t, ctx, in, out)
+
+	// The destination is on the BLAKE2b chain and asks in BTCB2. A hundred
+	// thousand sats of it is worth a few hundred sats of BTC, which is what
+	// the user's channel can carry.
+	const payMsat = 100_000_000 // 100k sats of BTCB2
+	lf2 := lnrpc.NewLightningClient(lf2Conn)
+	invoice, err := lf2.AddInvoice(ctx, &lnrpc.Invoice{
+		ValueMsat: payMsat, Memo: "paid from Bitcoin's Lightning network",
+		CltvExpiry: 40, Expiry: 3600,
+	})
+	if err != nil {
+		t.Fatalf("creating the destination invoice: %v", err)
+	}
+	t.Logf("destination invoice: %s...", invoice.GetPaymentRequest()[:32])
+
+	journal, err := store.Open(filepath.Join(t.TempDir(), "swaps.journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer journal.Close()
+
+	q := labQuoterReverse(t, in, out, lf1Conn, journal)
+
+	terms, err := q.Quote(ctx, invoice.GetPaymentRequest())
+	if err != nil {
+		t.Fatalf("quoting: %v", err)
+	}
+	t.Logf("quote: pay %d msat BTC for %d msat BTCB2, spread %.2f%%, "+
+		"incoming CLTV %d blocks, hold invoice %s...",
+		terms.IncomingMsat, terms.OutgoingMsat, terms.Spread*100,
+		terms.CLTVDelta, terms.HoldInvoice[:24])
+
+	// The other way round from the forward test, and for the same reason:
+	// a BTC msat buys many BTCB2 msat, so the payer brings fewer of them.
+	if terms.IncomingMsat >= terms.OutgoingMsat {
+		t.Errorf("the user pays %d BTC msat for %d BTCB2 msat, which is not "+
+			"the right way round at a rate of %g", terms.IncomingMsat,
+			terms.OutgoingMsat, 1/labRate)
+	}
+
+	paid := make(chan error, 1)
+	go func() { paid <- payHoldInvoice(ctx, t, sha2Conn, terms.HoldInvoice) }()
+
+	r := &runner.Runner{
+		Driver: &driver.Driver{
+			In: in, Out: out, Store: journal, Policy: labMargin,
+		},
+		Store: journal, Rates: labRatesReverse, Poll: 250 * time.Millisecond,
+		PayTimeout: 60 * time.Second,
+	}
+
+	driven := make(chan error, 1)
+	go func() { driven <- r.Drive(ctx, terms.Hash) }()
+
+	select {
+	case err := <-driven:
+		if err != nil {
+			t.Fatalf("driving the swap: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("the bridge did not finish the swap in time")
+	}
+
+	rec, err := journal.Get(context.Background(), terms.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.State != swap.Settled {
+		select {
+		case err := <-paid:
+			t.Fatalf("the swap ended in %v; the user's payment says: %v",
+				rec.State, err)
+		default:
+			t.Fatalf("the swap ended in %v, not settled", rec.State)
+		}
+	}
+	t.Logf("swap settled, preimage %x", rec.Preimage[:8])
+
+	select {
+	case err := <-paid:
+		if err != nil {
+			t.Fatalf("the user's payment did not succeed: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the user's payment never resolved after the bridge settled")
+	}
+
+	got, err := lf2.LookupInvoice(context.Background(), &lnrpc.PaymentHash{
+		RHash: terms.Hash[:],
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetState() != lnrpc.Invoice_SETTLED {
+		t.Fatalf("the destination's invoice is %v, not settled", got.GetState())
+	}
+	if got.GetAmtPaidMsat() != payMsat {
+		t.Errorf("the destination was paid %d msat, wanted %d",
+			got.GetAmtPaidMsat(), payMsat)
+	}
+
+	t.Logf("end to end: %d msat BTC in on Bitcoin, %d msat BTCB2 out on the "+
+		"BLAKE2b chain, one preimage settled both",
+		rec.IncomingMsat, got.GetAmtPaidMsat())
 }
