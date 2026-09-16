@@ -18,7 +18,7 @@ import (
 func (s *Service) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctxOrBackground(ctx))
 	defer cancel()
-	s.ctx = ctx
+	s.setDriveCtx(ctx)
 
 	// Observers first, and a moment to fill: a resumed swap is sized
 	// against block spacing, and an observer with nothing in it refuses.
@@ -134,7 +134,12 @@ func (s *Service) resume(ctx context.Context) error {
 	for _, rec := range pending {
 		sd, _, err := s.route(ctx, rec.Invoice)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%x: %w", rec.Hash, err))
+			// Nothing will drive this swap, and if its incoming HTLC is
+			// locked in it has a deadline. The usual cause is a direction
+			// that was enabled when the swap was quoted and is not now.
+			errs = append(errs, fmt.Errorf("swap %x (state %v, invoice %q) "+
+				"has no enabled direction that can pay it, so nothing will "+
+				"drive it: %w", rec.Hash, rec.State, rec.Invoice, err))
 
 			continue
 		}

@@ -125,6 +125,16 @@ func (s *Service) samplePrice(ctx context.Context) {
 		"sources", reading.Sources, "spread", reading.Spread)
 }
 
+// priceClient fetches prices. Redirects are refused rather than followed: the
+// URL is the operator's choice, and a source that answers with a redirect has
+// stopped being the thing they configured.
+var priceClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 // fetchPrice reads one source.
 func fetchPrice(ctx context.Context, src RateSource) (float64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -134,7 +144,7 @@ func fetchPrice(ctx context.Context, src RateSource) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := priceClient.Do(req)
 	if err != nil {
 		return 0, err
 	}

@@ -33,9 +33,11 @@ type side struct {
 	in  node.Incoming
 	out node.Outgoing
 
-	// outConn is the paying node, for reading the balance the spread is
-	// priced from: it is the side the bridge's own money leaves from.
-	outConn *grpc.ClientConn
+	// balance reports what the paying node can still send, which is the
+	// side the bridge's own money leaves from and so the side the spread
+	// is priced against. A function rather than a connection so the wiring
+	// above it can be exercised without two Lightning nodes.
+	balance func(context.Context) (uint64, error)
 
 	quoter *quote.Quoter
 	runner *runner.Runner
@@ -74,8 +76,14 @@ type Service struct {
 	// ctx is the service's own lifetime, which a swap driven from an HTTP
 	// request must outlive: the user may disconnect the moment after they
 	// pay, and the HTLC does not go away with their connection.
-	ctx context.Context
-	wg  sync.WaitGroup
+	//
+	// Guarded because Run replaces it with a cancellable one while the
+	// handler may already be serving. A caller that uses Handler directly,
+	// which the tests do, races with Run otherwise.
+	ctxMu sync.RWMutex
+	ctx   context.Context
+
+	wg sync.WaitGroup
 
 	closers []func() error
 }
@@ -152,7 +160,7 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 
 	sd := &side{
 		name: name, in: lnd.NewIncoming(inConn), out: lnd.NewOutgoing(outConn),
-		outConn: outConn, dir: dir, invert: invert,
+		balance: channelBalance(outConn), dir: dir, invert: invert,
 	}
 
 	sd.quoter = &quote.Quoter{
@@ -198,7 +206,7 @@ func (s *Service) pricer(sd *side, inv inventory.Policy) quote.Pricer {
 			r.OutgoingPerIncoming = 1 / r.OutgoingPerIncoming
 		}
 
-		held, err := s.outgoingBalance(ctx, sd)
+		held, err := sd.balance(ctx)
 		if err != nil {
 			return rate.Reading{}, err
 		}
@@ -216,15 +224,17 @@ func (s *Service) pricer(sd *side, inv inventory.Policy) quote.Pricer {
 	}
 }
 
-// outgoingBalance is what the paying node can still send.
-func (s *Service) outgoingBalance(ctx context.Context, sd *side) (uint64, error) {
-	bal, err := lnrpc.NewLightningClient(sd.outConn).ChannelBalance(ctx,
-		&lnrpc.ChannelBalanceRequest{})
-	if err != nil {
-		return 0, fmt.Errorf("reading the outgoing balance: %w", err)
-	}
+// channelBalance reads what a node can still send over its channels.
+func channelBalance(conn *grpc.ClientConn) func(context.Context) (uint64, error) {
+	return func(ctx context.Context) (uint64, error) {
+		bal, err := lnrpc.NewLightningClient(conn).ChannelBalance(ctx,
+			&lnrpc.ChannelBalanceRequest{})
+		if err != nil {
+			return 0, fmt.Errorf("reading the outgoing balance: %w", err)
+		}
 
-	return uint64(bal.GetLocalBalance().GetMsat()), nil
+		return uint64(bal.GetLocalBalance().GetMsat()), nil
+	}
 }
 
 // headroom is the outgoing balance less what is already promised to swaps
@@ -232,7 +242,7 @@ func (s *Service) outgoingBalance(ctx context.Context, sd *side) (uint64, error)
 // and expensive to forget.
 func (s *Service) headroom(sd *side) quote.Headroom {
 	return func(ctx context.Context) (uint64, error) {
-		held, err := s.outgoingBalance(ctx, sd)
+		held, err := sd.balance(ctx)
 		if err != nil {
 			return 0, err
 		}
@@ -277,6 +287,11 @@ func (s *Service) spacing(invert bool) func(context.Context) (driver.Rates, erro
 }
 
 // Close releases whatever was opened, in reverse order.
+//
+// Call it after Run returns, not alongside it: it closes the node connections
+// that swaps in flight are using. Run waits for those itself. Calling it twice
+// is harmless, which matters because New closes on a partial failure and the
+// caller's defer will close again.
 func (s *Service) Close() error {
 	var errs []error
 	for i := len(s.closers) - 1; i >= 0; i-- {
@@ -287,6 +302,22 @@ func (s *Service) Close() error {
 	s.closers = nil
 
 	return errors.Join(errs...)
+}
+
+// driveCtx is the lifetime a swap is driven on.
+func (s *Service) driveCtx() context.Context {
+	s.ctxMu.RLock()
+	defer s.ctxMu.RUnlock()
+
+	return s.ctx
+}
+
+// setDriveCtx is called once, by Run.
+func (s *Service) setDriveCtx(ctx context.Context) {
+	s.ctxMu.Lock()
+	defer s.ctxMu.Unlock()
+
+	s.ctx = ctx
 }
 
 // route picks the direction that can pay an invoice, by asking each paying

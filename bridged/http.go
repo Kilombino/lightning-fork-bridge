@@ -10,6 +10,7 @@ import (
 
 	"github.com/paulscode/lightning-fork-bridge/node"
 	"github.com/paulscode/lightning-fork-bridge/quote"
+	"github.com/paulscode/lightning-fork-bridge/runner"
 	"github.com/paulscode/lightning-fork-bridge/store"
 )
 
@@ -105,7 +106,15 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	// Deliberately not the request's context. Quoting creates a journal
+	// record and then a hold invoice on the node, in that order, and both
+	// outlive the connection that asked for them. Abandoning it half way
+	// because the caller hung up would leave a swap that only a restart
+	// would notice. Bounded, so a node that stops answering cannot pin the
+	// handler open.
+	ctx, cancel := context.WithTimeout(s.driveCtx(), 60*time.Second)
+	defer cancel()
+
 	sd, _, err := s.route(ctx, req.Invoice)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -210,8 +219,14 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Being unable to reach a node is the other way this is up and useless.
+	// Bounded: a node that accepts the connection and then says nothing
+	// would otherwise hang the health check, which is the one request that
+	// has to answer when things are wrong.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	for _, sd := range s.sides {
-		if _, err := s.outgoingBalance(ctx, sd); err != nil {
+		if _, err := sd.balance(ctx); err != nil {
 			out[sd.name] = err.Error()
 			ready = false
 		} else {
@@ -227,13 +242,31 @@ func (s *Service) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, out)
 }
 
-// drive finishes a swap in the background, on the service's own context.
+// drive finishes a swap in the background, on the service's own context
+// rather than on a request's: the hold invoice is live the moment it is
+// returned and the user may pay it after disconnecting.
 func (s *Service) drive(sd *side, hash node.Hash) {
+	ctx := s.driveCtx()
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 
-		if err := sd.runner.Drive(s.ctx, hash); err != nil {
+		err := sd.runner.Drive(ctx, hash)
+		switch {
+		case err == nil:
+		case errors.Is(err, runner.ErrBusy):
+			// Already being driven, which is what should happen when a
+			// user asks twice for the same invoice. The runner's rule is
+			// one goroutine per hash, and this is that rule working.
+			s.log.Debug("already driving", "direction", sd.name,
+				"hash", hex.EncodeToString(hash[:]))
+		case errors.Is(err, context.Canceled):
+			// Shutdown. The record is always at least as far along as the
+			// nodes are, so the next process picks it up.
+			s.log.Info("stopped driving for shutdown", "direction", sd.name,
+				"hash", hex.EncodeToString(hash[:]))
+		default:
 			s.log.Error("swap did not finish", "direction", sd.name,
 				"hash", hex.EncodeToString(hash[:]), "err", err)
 		}
