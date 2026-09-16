@@ -237,7 +237,7 @@ func (e errUserPaymentFailed) Error() string {
 // The destination's invoice is cancelled after the quote is struck but before
 // the user funds it, so the outgoing leg fails definitively against a real
 // node. The incoming HTLC must come back. Nothing about this is the bridge
-// being clever — it is the state machine refusing to let a cancel happen until
+// being clever: it is the state machine refusing to let a cancel happen until
 // the outgoing leg is definitively resolved, and then insisting on it.
 func TestLiveRefund(t *testing.T) {
 	dir := lab(t)
@@ -460,7 +460,7 @@ func payHoldInvoice(ctx context.Context, t *testing.T, conn *grpc.ClientConn,
 //
 // An idle regtest goes unsynced on its own: lnd judges by the age of the best
 // block, so a chain nobody is mining drifts out of sync without falling
-// behind. That is the lab, not the bridge — on a live chain the same check is
+// behind. That is the lab, not the bridge; on a live chain the same check is
 // what stops a swap being sized against a height that is not the present one.
 func checkNodes(t *testing.T, ctx context.Context, in *lnd.Incoming,
 	out *lnd.Outgoing) {

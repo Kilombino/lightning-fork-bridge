@@ -2,7 +2,7 @@
 
 Swaps between the Bitcoin BLAKE2b chain's Lightning network and Bitcoin's.
 
-A user pays a `lnbc…` invoice from a Lightning Fork node, or is paid by someone
+A user pays a `lnbc...` invoice from a Lightning Fork node, or is paid by someone
 on the SHA256 chain, without either side giving custody to anyone: both
 networks use the same HTLC construction and the same SHA256 payment hash, so a
 hold invoice on the receiving chain and a payment on the sending chain settle
@@ -53,7 +53,7 @@ because `OutgoingFailed` is the single event that lets the bridge give up its
 incoming claim.
 
 `runner` holds two rules. One goroutine per payment hash, ever: a swap's
-safety is a sequence — read the nodes, decide, record, act — and two goroutines
+safety is a sequence (read the nodes, decide, record, act) and two goroutines
 interleaving it can gate against one reading and pay against another. And a
 split between failures that must be retried and failures that must not.
 A node that did not answer says nothing about the swap, and abandoning a live
@@ -63,14 +63,14 @@ has said it must not decide alone, must not be repeated at all.
 Not every swap can be hash-linked, and `swap.Binding` says which kind each one
 is rather than leaving it to be inferred. A **hash-linked** swap shares one
 payment hash, so the bridge physically cannot claim the incoming funds without
-having delivered — a fact about what it holds, which survives any bug in this
+having delivered, a fact about what it holds which survives any bug in this
 program. A **sequenced** swap cannot: a payout's outgoing invoice is issued by
 the recipient's node, which chooses its own preimage, so the legs have
 different hashes and the bridge knows the incoming preimage from the start.
 There the protection is the *order*, enforced here rather than by arithmetic:
 the incoming HTLC is held until the outgoing leg has definitively succeeded, so
 the recipient is paid before the bridge collects. What that protects them from
-is failure, not malice — and the code says so where it matters rather than
+is failure, not malice, and the code says so where it matters rather than
 letting the two be mistaken for one another.
 
 `quote` never chooses the payment hash. It comes from the invoice the user
@@ -83,7 +83,7 @@ out of, an incoming amount rounded in the payer's favour on every swap, a
 second hold invoice for a hash that already has one.
 
 `inventory` exists because the number the design most wanted to know in
-advance — how much flow comes back the other way — is not knowable in advance.
+advance, how much flow comes back the other way, is not knowable in advance.
 It is demand to be created, not a fact to be measured, and a bridge that had to
 predict it before it could quote would never start. So it is not predicted. The
 spread is a function of the measured position instead: one-way flow drains the
@@ -91,7 +91,7 @@ outgoing side and prices itself at what one-way flow costs (3% at the default
 policy), balanced flow never drains it and sits at the floor (1%), and nobody
 decided which it would be. A swap in the replenishing direction gets a discount
 instead, because it is doing the bridge a favour it would otherwise pay a venue
-for — capped at what that venue would have charged, and lifted rather than
+for, capped at what that venue would have charged, and lifted rather than
 zeroed when there is no venue at all, since flow is then the only mechanism
 there is.
 
