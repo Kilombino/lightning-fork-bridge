@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -459,4 +460,57 @@ func emptyObserver(t *testing.T) *chainrate.Observer {
 	}
 
 	return obs
+}
+
+// The oracle bounds how old an observation may be when it combines them.
+// Nothing bounded how old the combined reading was by the time a quote used
+// it, so a poller that stopped producing left the last price in place and
+// quotes went out on it.
+func TestPricerRefusesAPriceThatStoppedBeingRefreshed(t *testing.T) {
+	t.Parallel()
+
+	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
+	s.cfg.Rate.MaxAge = 90 * time.Second
+	s.priceErr = nil
+
+	// Fresh enough: quoted.
+	s.price = rate.Reading{
+		OutgoingPerIncoming: 0.003, At: time.Now().Add(-30 * time.Second),
+		Sources: 2, Spread: 0.01,
+	}
+	if _, err := s.pricer(s.sides[0], inventoryForTest())(
+		context.Background()); err != nil {
+
+		t.Fatalf("a price inside MaxAge should be usable: %v", err)
+	}
+
+	// Older than the policy allows: refused, and the reason says why.
+	s.price.At = time.Now().Add(-10 * time.Minute)
+	_, err := s.pricer(s.sides[0], inventoryForTest())(context.Background())
+	if err == nil {
+		t.Fatal("a price older than MaxAge should be refused")
+	}
+	if !strings.Contains(err.Error(), "price feed has stopped") {
+		t.Errorf("the refusal should say the feed stopped: %v", err)
+	}
+}
+
+// An invoice for a direction the operator turned off should send them to the
+// line they changed, not to their nodes.
+func TestRouteNamesADisabledDirection(t *testing.T) {
+	t.Parallel()
+
+	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
+	s.disabled = []string{"toBlake2b"}
+
+	_, _, err := s.route(context.Background(), "lnblakert1m1p4invoice")
+	if !errors.Is(err, ErrNoDirection) {
+		t.Fatalf("wanted ErrNoDirection, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "toBlake2b") {
+		t.Errorf("the refusal should name the disabled direction: %v", err)
+	}
+	if !strings.Contains(err.Error(), "not enabled") {
+		t.Errorf("the refusal should say it is switched off: %v", err)
+	}
 }

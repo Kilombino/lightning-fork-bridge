@@ -281,3 +281,49 @@ func TestNodeDetailsReachTheDialler(t *testing.T) {
 		t.Errorf("the dialler config does not match: %+v against %+v", got, n)
 	}
 }
+
+// Two misconfigurations that each look reasonable in isolation.
+func TestConfigCatchesIncoherentPairs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		edit func(string) string
+		want string
+	}{
+		{
+			// A copy-paste that would have the bridge hold an invoice and
+			// pay one on the same node.
+			name: "both nodes are the same",
+			edit: func(s string) string {
+				return strings.Replace(s, `"address": "btc:10009"`,
+					`"address": "lf:10009"`, 1)
+			},
+			want: "two nodes",
+		},
+		{
+			// Polling more slowly than the price may age guarantees the
+			// daemon refuses most quotes for a reason nobody chose.
+			name: "polled more slowly than the price may age",
+			edit: func(s string) string {
+				return strings.Replace(s, `"rateSources"`,
+					`"pollInterval": 600000000000, "rateSources"`, 1)
+			},
+			want: "not been refreshed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, test.edit(good))
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("wanted ErrConfig, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Errorf("the error should say %q, said: %v", test.want, err)
+			}
+		})
+	}
+}

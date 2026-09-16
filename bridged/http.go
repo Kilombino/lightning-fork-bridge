@@ -52,7 +52,13 @@ type QuoteResponse struct {
 	// know which node to pay from.
 	Direction string `json:"direction"`
 
-	// ExpiresAt is when the quote stops being honoured.
+	// ExpiresAt is the deadline for paying HoldInvoice. Pay it before this
+	// and the swap proceeds at the quoted rate; leave it and the bridge
+	// cancels the hold invoice, after which paying it fails.
+	//
+	// It only applies while the invoice is unpaid. Once the incoming HTLC
+	// is locked in, the swap is no longer racing a clock in minutes and
+	// the CLTV in CLTVDelta is what bounds it.
 	ExpiresAt time.Time `json:"expiresAt"`
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +63,12 @@ type Service struct {
 	// sides holds whichever directions are enabled, in the order a quote
 	// request tries them.
 	sides []*side
+
+	// disabled names the directions that are configured and turned off, so
+	// an invoice for one can be refused by name. "No enabled direction can
+	// pay this" sends an operator looking at their nodes; "toBlake2b is
+	// configured but not enabled" sends them to the line they changed.
+	disabled []string
 
 	oracle   *rate.Oracle
 	lfChain  *chainrate.Observer
@@ -142,6 +149,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 	if cfg.ToBitcoin.Enabled {
 		s.sides = append(s.sides, s.build("toBitcoin", cfg.ToBitcoin,
 			s.lfConn, s.btcConn, inventory.Draining, false))
+	} else {
+		s.disabled = append(s.disabled, "toBitcoin")
 	}
 	if cfg.ToBlake2b.Enabled {
 		// The sources quote BTCB2 in BTC, so the direction that pays in
@@ -149,6 +158,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		// back what the other one spends.
 		s.sides = append(s.sides, s.build("toBlake2b", cfg.ToBlake2b,
 			s.btcConn, s.lfConn, inventory.Replenishing, true))
+	} else {
+		s.disabled = append(s.disabled, "toBlake2b")
 	}
 
 	return s, nil
@@ -196,6 +207,20 @@ func (s *Service) pricer(sd *side, inv inventory.Policy) quote.Pricer {
 		s.priceMu.RUnlock()
 		if err != nil {
 			return rate.Reading{}, err
+		}
+
+		// The oracle bounds how old an observation may be when it combines
+		// them. Nothing bounds how old the combined reading is by the time
+		// a quote uses it, and a poller that has stopped producing leaves
+		// the last one in place indefinitely. Refuse rather than quote on
+		// a price the policy itself would not have accepted.
+		if max := s.cfg.Rate.MaxAge; max > 0 {
+			if age := time.Since(r.At); age > max {
+				return rate.Reading{}, fmt.Errorf("%w: the last usable "+
+					"price is %v old and the policy allows %v, so the "+
+					"price feed has stopped", quote.ErrRefused,
+					age.Round(time.Second), max)
+			}
 		}
 
 		if sd.invert {
@@ -334,6 +359,15 @@ func (s *Service) route(ctx context.Context, invoice string) (*side, node.Decode
 			return sd, dec, nil
 		}
 		last = err
+	}
+
+	// Say so if the direction exists and is switched off, which is the
+	// difference between "this daemon cannot do that" and "you turned that
+	// off".
+	if len(s.disabled) > 0 {
+		return nil, node.Decoded{}, fmt.Errorf("%w: %s configured but not "+
+			"enabled, and no enabled direction could read it",
+			ErrNoDirection, strings.Join(s.disabled, " and "))
 	}
 
 	if last == nil {

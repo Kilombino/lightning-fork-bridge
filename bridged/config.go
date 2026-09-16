@@ -91,8 +91,9 @@ func (c Chain) toParams() chainrate.Params {
 // to pay out cannot serve the reverse direction, and saying so in the config
 // is better than quoting and then failing on headroom.
 type Direction struct {
-	// Enabled runs this direction. A direction that is configured but not
-	// enabled is refused at quote time rather than silently absent.
+	// Enabled runs this direction. One that is configured and not enabled
+	// is not wired at all, and an invoice for it is refused by name rather
+	// than as though the daemon had never heard of that chain.
 	Enabled bool `json:"enabled"`
 
 	// Policy is the terms offered in this direction.
@@ -259,6 +260,21 @@ func (c Config) Valid() error {
 	}
 	if err := c.reachable(); err != nil {
 		return err
+	}
+	if c.Blake2b.Address == c.Bitcoin.Address {
+		return fmt.Errorf("%w: both nodes are %s, so the bridge would hold "+
+			"an invoice and pay one on the same node. The two chains need "+
+			"two nodes", ErrConfig, c.Blake2b.Address)
+	}
+	// The oracle refuses an observation older than MaxAge, so polling more
+	// slowly than that guarantees every reading is stale by the daemon's own
+	// policy for most of its life, and quotes would be refused constantly
+	// for a reason the operator never chose.
+	if c.pollInterval() >= c.Rate.MaxAge {
+		return fmt.Errorf("%w: prices are polled every %v but the policy "+
+			"calls an observation stale after %v, so most quotes would be "+
+			"refused on a price that had simply not been refreshed",
+			ErrConfig, c.pollInterval(), c.Rate.MaxAge)
 	}
 
 	return nil

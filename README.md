@@ -112,6 +112,7 @@ error found later costs whatever was in flight.
 | Endpoint | What it does |
 | --- | --- |
 | `POST /quote` | takes an invoice on either chain, returns a hold invoice on the other |
+| | `expiresAt` is the deadline for paying it. Miss it and the hold invoice is cancelled; pay it and the CLTV, not the clock, is what bounds the swap |
 | `GET /swap/{hash}` | what the bridge believes about one swap, and the preimage once there is one |
 | `GET /health` | whether it could quote right now, which is not the same as whether it is running |
 
