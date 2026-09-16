@@ -95,6 +95,48 @@ for, capped at what that venue would have charged, and lifted rather than
 zeroed when there is no venue at all, since flow is then the only mechanism
 there is.
 
+## Running it
+
+    bridged -config /etc/bridged/config.json -check   # connect and exit
+    bridged -config /etc/bridged/config.json          # run
+
+`config.example.json` is a starting point. There are no defaults for anything
+that decides what a swap costs or how long it may take, and unknown keys are an
+error rather than ignored: a misspelled policy key that is quietly dropped
+leaves the daemon running on a number the operator believes they overrode.
+
+`-check` loads the configuration, dials both nodes and opens the journal, then
+exits. A configuration error found at deploy time costs a restart; the same
+error found later costs whatever was in flight.
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /quote` | takes an invoice on either chain, returns a hold invoice on the other |
+| `GET /swap/{hash}` | what the bridge believes about one swap, and the preimage once there is one |
+| `GET /health` | whether it could quote right now, which is not the same as whether it is running |
+
+There is no authentication. A quote commits the bridge's money, so this belongs
+on loopback or behind something that authenticates, and a weak scheme here
+would be worse than saying so plainly.
+
+Which direction a request is depends on the invoice, and the daemon works that
+out by asking each paying node to decode it rather than by parsing it here. The
+node that can read an invoice is the node that will pay it, which is the same
+reason `quote` takes the payment hash from the paying node.
+
+Three numbers have to fit together and each looks reasonable alone: the
+outgoing CLTV budget, the settlement allowance, and how fast the incoming chain
+can produce blocks. The incoming CLTV a swap needs is roughly the first two
+divided by the third, and if that exceeds `margin.maxIncomingBlocks` the bridge
+refuses every swap it is offered. Planning for the full 19x surge this chain
+has shown, while keeping an outgoing budget that suits ordinary destinations,
+does exactly that. The daemon checks the combination at startup rather than
+letting it surface as a refusal on the first quote.
+
+`GET /health` answers 503 when there is no usable price, a chain it cannot
+measure, or a node it cannot reach. A bridge in any of those states is up and
+unable to do anything, and reporting "ok" is how that goes unnoticed.
+
 ## Status
 
 Built and tested: the logic that decides, the record it decides against, the
@@ -125,9 +167,15 @@ the replenishing flow look like it depended on a mining integration. It does
 not. An ordinary payment in the other direction is hash-linked exactly like the
 forward one, needs no payout adapter, and replenishes just as well.
 
+**The daemon runs both of those against the lab.** A swap quoted over
+`POST /quote`, paid by a user, driven to settlement and reported by
+`GET /swap/{hash}`, in both directions. And the thing a daemon exists for:
+a swap quoted before a restart is picked up by the next process, driven when
+the user pays it afterwards, and settled. Recovery is not a claim about the
+journal here, it is something that happened.
+
 Not built: the payout adapter, which is the **sequenced** binding for a payer
-that issues its own invoice, and the daemon that wires this behind a
-configuration file. Nothing has run against mainnet.
+that issues its own invoice. Nothing has run against mainnet.
 
 Nothing here has moved money. The order was deliberate: the parts that lose
 funds when they are wrong are the parts that can be tested exhaustively

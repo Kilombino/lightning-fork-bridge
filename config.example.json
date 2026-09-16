@@ -1,0 +1,102 @@
+{
+  "listen": "127.0.0.1:9737",
+  "journal": "/var/lib/bridged/swaps.journal",
+  "blake2b": {
+    "address": "127.0.0.1:10009",
+    "tlsCert": "/var/lib/bridged/lf-tls.cert",
+    "macaroon": "/var/lib/bridged/lf-admin.macaroon"
+  },
+  "bitcoin": {
+    "address": "127.0.0.1:10010",
+    "tlsCert": "/var/lib/bridged/btc-tls.cert",
+    "macaroon": "/var/lib/bridged/btc-admin.macaroon"
+  },
+  "blake2bChain": {
+    "retargetInterval": 2016,
+    "targetSpacing": 600000000000,
+    "surgeFactor": 4,
+    "stallFactor": 4,
+    "minSamples": 6,
+    "staleAfter": 3600000000000,
+    "surgeWindow": 12
+  },
+  "bitcoinChain": {
+    "retargetInterval": 2016,
+    "targetSpacing": 600000000000,
+    "surgeFactor": 2,
+    "stallFactor": 2,
+    "minSamples": 6,
+    "staleAfter": 7200000000000,
+    "surgeWindow": 12
+  },
+  "margin": {
+    "Settlement": 1800000000000,
+    "MaxIncomingBlocks": 2016
+  },
+  "rate": {
+    "maxAge": 300000000000,
+    "maxDisagreement": 0.02,
+    "breakerMove": 0.1,
+    "breakerWindow": 600000000000,
+    "cooldown": 1800000000000,
+    "baseSpread": 0.01,
+    "volatilityMultiple": 2,
+    "maxSpread": 0.05
+  },
+  "rateSources": [
+    {
+      "name": "venue-a",
+      "url": "https://example.invalid/api/ticker/BTCB2_BTC",
+      "field": "last"
+    },
+    {
+      "name": "venue-b",
+      "url": "https://example2.invalid/v1/price",
+      "field": "data.price"
+    }
+  ],
+  "toBitcoin": {
+    "enabled": true,
+    "policy": {
+      "minSwapMsat": 100000,
+      "maxSwapMsat": 500000000,
+      "validity": 120000000000,
+      "invoiceExpiry": 600000000000,
+      "outgoingCLTVLimit": 80,
+      "feeFraction": 0.003,
+      "minRemainingLife": 120000000000
+    },
+    "inventory": {
+      "TargetOutgoingMsat": 100000000,
+      "FloorOutgoingMsat": 10000000,
+      "BaseSpread": 0.01,
+      "MaxSpread": 0.03,
+      "MaxDiscount": 0.003,
+      "RebalanceCost": 0.004,
+      "Curve": 1,
+      "MaxAge": 300000000000
+    }
+  },
+  "toBlake2b": {
+    "enabled": true,
+    "policy": {
+      "minSwapMsat": 100000,
+      "maxSwapMsat": 500000000,
+      "validity": 120000000000,
+      "invoiceExpiry": 600000000000,
+      "outgoingCLTVLimit": 80,
+      "feeFraction": 0.003,
+      "minRemainingLife": 120000000000
+    },
+    "inventory": {
+      "TargetOutgoingMsat": 100000000,
+      "FloorOutgoingMsat": 10000000,
+      "BaseSpread": 0.01,
+      "MaxSpread": 0.03,
+      "MaxDiscount": 0.003,
+      "RebalanceCost": 0.004,
+      "Curve": 1,
+      "MaxAge": 300000000000
+    }
+  }
+}

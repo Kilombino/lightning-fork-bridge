@@ -1,0 +1,215 @@
+package bridged
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// good is a configuration that loads, so each test can break exactly one
+// thing and the failure names that thing rather than the first missing field.
+const good = `{
+  "listen": "127.0.0.1:9737",
+  "journal": "/tmp/swaps.journal",
+  "blake2b": {"address": "lf:10009", "tlsCert": "/t.cert", "macaroon": "/m"},
+  "bitcoin": {"address": "btc:10009", "tlsCert": "/t.cert", "macaroon": "/m"},
+  "blake2bChain": {
+    "retargetInterval": 2016, "targetSpacing": 600000000000,
+    "surgeFactor": 4, "stallFactor": 4, "minSamples": 6,
+    "staleAfter": 3600000000000, "surgeWindow": 12
+  },
+  "bitcoinChain": {
+    "retargetInterval": 2016, "targetSpacing": 600000000000,
+    "surgeFactor": 2, "stallFactor": 2, "minSamples": 6,
+    "staleAfter": 7200000000000, "surgeWindow": 12
+  },
+  "margin": {"Settlement": 1800000000000, "MaxIncomingBlocks": 2016},
+  "rate": {
+    "maxAge": 300000000000, "maxDisagreement": 0.02, "breakerMove": 0.1,
+    "breakerWindow": 600000000000, "cooldown": 1800000000000,
+    "baseSpread": 0.01, "volatilityMultiple": 2, "maxSpread": 0.05
+  },
+  "rateSources": [{"name": "venue", "url": "https://x/p", "field": "price"}],
+  "toBitcoin": {
+    "enabled": true,
+    "policy": {
+      "minSwapMsat": 100000, "maxSwapMsat": 500000000,
+      "validity": 120000000000, "invoiceExpiry": 600000000000,
+      "outgoingCLTVLimit": 80, "feeFraction": 0.003,
+      "minRemainingLife": 120000000000
+    },
+    "inventory": {
+      "TargetOutgoingMsat": 100000000, "FloorOutgoingMsat": 10000000,
+      "BaseSpread": 0.01, "MaxSpread": 0.03, "MaxDiscount": 0.003,
+      "RebalanceCost": 0.004, "Curve": 1, "MaxAge": 300000000000
+    }
+  }
+}`
+
+func load(t *testing.T, s string) (Config, error) {
+	t.Helper()
+
+	return Load(strings.NewReader(s))
+}
+
+func TestGoodConfigLoads(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := load(t, good)
+	if err != nil {
+		t.Fatalf("the reference configuration should load: %v", err)
+	}
+	if !cfg.ToBitcoin.Enabled || cfg.ToBlake2b.Enabled {
+		t.Errorf("expected only toBitcoin enabled, got toBitcoin=%v "+
+			"toBlake2b=%v", cfg.ToBitcoin.Enabled, cfg.ToBlake2b.Enabled)
+	}
+	if cfg.pollInterval() != 30*time.Second {
+		t.Errorf("poll interval defaulted to %v, wanted 30s",
+			cfg.pollInterval())
+	}
+}
+
+// A misspelled key that is ignored leaves the daemon running on a default the
+// operator believes they overrode, which is the worst of both.
+func TestUnknownFieldsAreRefused(t *testing.T) {
+	t.Parallel()
+
+	_, err := load(t, strings.Replace(good, `"listen"`, `"lissen"`, 1))
+	if !errors.Is(err, ErrConfig) {
+		t.Fatalf("a misspelled key should be refused, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "lissen") {
+		t.Errorf("the error should name the key it did not know: %v", err)
+	}
+}
+
+func TestRefusals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		edit func(string) string
+		want string
+	}{
+		{
+			name: "no rate source",
+			edit: func(s string) string {
+				return strings.Replace(s,
+					`[{"name": "venue", "url": "https://x/p", "field": "price"}]`,
+					`[]`, 1)
+			},
+			want: "no rate sources",
+		},
+		{
+			name: "no direction enabled",
+			edit: func(s string) string {
+				return strings.Replace(s, `"enabled": true`,
+					`"enabled": false`, 1)
+			},
+			want: "neither direction is enabled",
+		},
+		{
+			name: "no journal",
+			edit: func(s string) string {
+				return strings.Replace(s, `"journal": "/tmp/swaps.journal"`,
+					`"journal": ""`, 1)
+			},
+			want: "no journal path",
+		},
+		{
+			name: "node without a macaroon",
+			edit: func(s string) string {
+				return strings.Replace(s, `"macaroon": "/m"}`,
+					`"macaroon": ""}`, 1)
+			},
+			want: "macaroon",
+		},
+		{
+			// A quote that outlives the invoice it is for is a promise the
+			// bridge cannot keep, and it is quiet until someone tries.
+			name: "quote outlives its hold invoice",
+			edit: func(s string) string {
+				return strings.Replace(s, `"invoiceExpiry": 600000000000`,
+					`"invoiceExpiry": 60000000000`, 1)
+			},
+			want: "outlive",
+		},
+		{
+			// Each of the three looks reasonable alone. Planning for the
+			// full surge the chain has shown, with an outgoing budget
+			// that suits ordinary destinations, needs more incoming
+			// blocks than anyone will route.
+			name: "conservative surge against a low block cap",
+			edit: func(s string) string {
+				return strings.Replace(s, `"surgeFactor": 4, "stallFactor": 4`,
+					`"surgeFactor": 19, "stallFactor": 4`, 1)
+			},
+			want: "could not quote any swap",
+		},
+		{
+			name: "no maximum swap size",
+			edit: func(s string) string {
+				return strings.Replace(s, `"maxSwapMsat": 500000000`,
+					`"maxSwapMsat": 0`, 1)
+			},
+			want: "maximum swap size",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := load(t, test.edit(good))
+			if !errors.Is(err, ErrConfig) {
+				t.Fatalf("wanted ErrConfig, got %v", err)
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Errorf("the error should say %q, said: %v", test.want, err)
+			}
+		})
+	}
+}
+
+func TestExtractReadsNumbersAndStrings(t *testing.T) {
+	t.Parallel()
+
+	doc := map[string]any{
+		"price":  0.00308078,
+		"quoted": "0.00308078",
+		"data":   map[string]any{"last": 1.5},
+		"wrong":  "not a number",
+	}
+
+	tests := []struct {
+		path string
+		want float64
+		ok   bool
+	}{
+		{path: "price", want: 0.00308078, ok: true},
+		// Venues quote numbers as strings often enough that refusing them
+		// would mean refusing the venue.
+		{path: "quoted", want: 0.00308078, ok: true},
+		{path: "data.last", want: 1.5, ok: true},
+		{path: "wrong"},
+		{path: "missing"},
+		{path: "price.deeper"},
+	}
+
+	for _, test := range tests {
+		got, err := extract(doc, test.path)
+		if test.ok {
+			if err != nil {
+				t.Errorf("%s: unexpected error %v", test.path, err)
+			} else if got != test.want {
+				t.Errorf("%s: got %v, wanted %v", test.path, got, test.want)
+			}
+
+			continue
+		}
+		if err == nil {
+			t.Errorf("%s: wanted an error, got %v", test.path, got)
+		}
+	}
+}
