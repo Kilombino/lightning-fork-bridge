@@ -3,14 +3,14 @@
 How a wallet asks a bridge to pay an invoice on the other chain, version 1.
 
 A bridge is a Lightning Fork node running the bridge sub-server, next to a
-stock lnd on Bitcoin. A payer is anything holding a **bridge code** the
+stock lnd on the SHA256 chain. A payer is anything holding a **bridge code** the
 operator issued: in practice, the dashboard that comes with Lightning Fork. The
 payer never trusts the bridge with funds. It pays a hold invoice that carries
 the same payment hash as the invoice it wants paid, so the bridge can only
 collect by paying that invoice, and the payer's own node ends up holding the
 preimage as proof.
 
-This document covers paying a **Bitcoin invoice from the BLAKE2b chain**
+This document covers paying a **SHA256 invoice from the BLAKE2b chain**
 (direction `toSHA256`). The calls are direction-agnostic, and the reverse
 direction uses them unchanged.
 
@@ -75,7 +75,7 @@ so a payer may call it to show a price before the user commits.
 }
 ```
 
-- `rate`: outgoing units per incoming unit. For `toSHA256` that is Bitcoin per
+- `rate`: outgoing units per incoming unit. For `toSHA256` that is BTC (SHA256) per
   BTCB2.
 - `rate_set_at`: Unix seconds when the operator set the rate, or the time of
   the last price reading.
