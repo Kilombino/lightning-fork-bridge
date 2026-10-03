@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -182,11 +183,140 @@ type Quoter struct {
 	// Policy is the terms offered.
 	Policy Policy
 
+	// PaysBLAKE2b is whether Out pays on the BLAKE2b chain. An invoice is
+	// quoted only if it is for the chain Out pays on, which it says by
+	// setting option_blake2b or not. Both chains' invoices share a prefix
+	// and both nodes can read every one, so without this a BLAKE2b invoice
+	// could be quoted for payment on Bitcoin, where it can never arrive.
+	PaysBLAKE2b bool
+
+	// Own is the bridge's own node keys, hex. An invoice payable to one of
+	// them is refused: the bridge would be paying itself through its own
+	// hold invoice, which moves nothing and ties up both sides.
+	Own []string
+
+	// Limits bounds each participant on their own. The operator's own
+	// swaps, which carry no participant, are not limited.
+	Limits Limits
+
 	// Now is the clock, for tests.
 	Now func() time.Time
 
 	mu      sync.Mutex
 	quoting map[node.Hash]struct{}
+
+	// whoMu guards who and recent.
+	whoMu sync.Mutex
+	// who holds one lock per participant, taken for the length of a quote,
+	// so two quotes from one participant cannot both pass a limit that only
+	// one of them fits under.
+	who map[string]*sync.Mutex
+	// recent is when each participant's last quotes were asked for, for the
+	// per-minute limit. In memory only: a restart forgetting it lets a
+	// participant quote again sooner, which the open-quote limit, kept in
+	// the journal, still bounds.
+	recent map[string][]time.Time
+}
+
+// Limits is what one participant may hold. A zero field means no limit.
+type Limits struct {
+	// MaxUnpaid is how many quotes they may have unpaid at once. This is
+	// the one that matters most: an unpaid quote reserves the bridge's
+	// liquidity and costs the participant nothing.
+	MaxUnpaid int
+
+	// MaxInProgress is how many swaps they may have unfinished at once,
+	// paid or not. With the policy's per-swap maximum it bounds the value
+	// one participant can have outstanding.
+	MaxInProgress int
+
+	// PerMinute is how many quotes they may ask for in any minute.
+	PerMinute int
+}
+
+// DefaultLimits suits a small group of named participants.
+var DefaultLimits = Limits{MaxUnpaid: 2, MaxInProgress: 4, PerMinute: 6}
+
+// enter takes a participant's lock and checks their limits. The returned
+// function releases the lock. An empty participant is the operator, who is
+// not limited.
+func (q *Quoter) enter(ctx context.Context, who string,
+	now time.Time) (func(), error) {
+
+	if who == "" {
+		return func() {}, nil
+	}
+
+	q.whoMu.Lock()
+	if q.who == nil {
+		q.who = map[string]*sync.Mutex{}
+		q.recent = map[string][]time.Time{}
+	}
+	mu, ok := q.who[who]
+	if !ok {
+		mu = &sync.Mutex{}
+		q.who[who] = mu
+	}
+	q.whoMu.Unlock()
+
+	mu.Lock()
+	release := mu.Unlock
+
+	if n := q.Limits.PerMinute; n > 0 {
+		q.whoMu.Lock()
+		kept := q.recent[who][:0]
+		for _, t := range q.recent[who] {
+			if now.Sub(t) < time.Minute {
+				kept = append(kept, t)
+			}
+		}
+		q.recent[who] = kept
+		over := len(kept) >= n
+		if !over {
+			q.recent[who] = append(q.recent[who], now)
+		}
+		q.whoMu.Unlock()
+
+		if over {
+			release()
+
+			return nil, fmt.Errorf("%w: %w: %d quotes in the last "+
+				"minute", ErrRefused, ErrLimit, n)
+		}
+	}
+
+	if q.Limits.MaxUnpaid > 0 || q.Limits.MaxInProgress > 0 {
+		pending, err := q.Store.Pending(ctx)
+		if err != nil {
+			release()
+
+			return nil, fmt.Errorf("reading pending swaps: %w", err)
+		}
+		var unpaid, open int
+		for _, r := range pending {
+			if r.Participant != who {
+				continue
+			}
+			open++
+			if r.State == swap.Quoted || r.State == swap.Offered {
+				unpaid++
+			}
+		}
+		if n := q.Limits.MaxUnpaid; n > 0 && unpaid >= n {
+			release()
+
+			return nil, fmt.Errorf("%w: %w: %d quotes unpaid; pay or "+
+				"let one expire first", ErrRefused, ErrLimit, unpaid)
+		}
+		if n := q.Limits.MaxInProgress; n > 0 && open >= n {
+			release()
+
+			return nil, fmt.Errorf("%w: %w: %d swaps in progress",
+				ErrRefused, ErrLimit, open)
+		}
+	}
+
+	return release, nil
 }
 
 // begin takes exclusive charge of a payment hash for the length of one quote.
@@ -231,11 +361,20 @@ func (q *Quoter) now() time.Time {
 	return time.Now()
 }
 
-// Quote prices a swap, creates the hold invoice, and records it.
+// Quote prices a swap for the operator, who is not limited. See QuoteFor.
+func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
+	return q.QuoteFor(ctx, "", invoice)
+}
+
+// QuoteFor prices a swap, creates the hold invoice, and records it, on behalf
+// of a participant whose limits apply.
 //
 // On success the swap is in swap.Offered and ready for the runner. On any
-// refusal nothing has been created on either chain.
-func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
+// refusal nothing has been created on either chain, except where the error
+// is ErrUntracked, which the caller must act on.
+func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
+	error) {
+
 	if err := q.Policy.Valid(); err != nil {
 		return Quote{}, err
 	}
@@ -253,26 +392,32 @@ func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
 	// invoice for one hash while the node paid another.
 	dec, err := q.Out.Decode(ctx, invoice)
 	if err != nil {
-		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
+		return Quote{}, fmt.Errorf("%w: %w: %w", ErrRefused,
+			ErrInvalidInvoice, err)
 	}
 
 	if err := q.checkInvoice(dec, now); err != nil {
 		return Quote{}, err
 	}
 
+	release, err := q.enter(ctx, who, now)
+	if err != nil {
+		return Quote{}, err
+	}
+	defer release()
+
 	if err := q.begin(dec.Hash); err != nil {
 		return Quote{}, err
 	}
 	defer q.end(dec.Hash)
 
-	// A second hold invoice for a hash that already has one would let the
-	// same preimage claim twice, and would leave two records fighting over
-	// one swap. Refuse before anything is created.
-	if existing, err := q.Store.Get(ctx, dec.Hash); err == nil {
-		return Quote{}, fmt.Errorf("%w: %x is %v", ErrDuplicate, dec.Hash,
-			existing.State)
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return Quote{}, fmt.Errorf("checking for an existing swap: %w", err)
+	// A second hold invoice for a hash that already has a live one would let
+	// the same preimage claim twice, and would leave two records fighting
+	// over one swap. Refuse before anything is created. A swap that ended
+	// without paying is different, and see again below.
+	forget, err := q.previous(ctx, dec.Hash)
+	if err != nil {
+		return Quote{}, err
 	}
 
 	// What the bridge can actually pay, which is not what its balance says:
@@ -284,9 +429,9 @@ func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
 		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
 	}
 	if dec.AmountMsat > room {
-		return Quote{}, fmt.Errorf("%w: %d msat against %d msat of headroom; "+
-			"the rest is promised to swaps that have not finished",
-			ErrRefused, dec.AmountMsat, room)
+		return Quote{}, fmt.Errorf("%w: %w: %d msat against %d msat of "+
+			"headroom; the rest is promised to swaps that have not "+
+			"finished", ErrRefused, ErrNoLiquidity, dec.AmountMsat, room)
 	}
 
 	reading, err := q.Price(ctx)
@@ -319,11 +464,83 @@ func (q *Quoter) Quote(ctx context.Context, invoice string) (Quote, error) {
 	terms.CLTVDelta = blocks
 	terms.Expires = now.Add(q.Policy.Validity)
 
-	if err := q.create(ctx, &terms, now); err != nil {
+	// Last, once everything else has said yes, so that a refused quote
+	// leaves the previous attempt's invoice where it was. Forgetting it
+	// first and then refusing would be harmless, since it was cancelled,
+	// but it would erase what an operator might want to look at.
+	if forget {
+		if err := q.In.ForgetInvoice(ctx, dec.Hash); err != nil {
+			return Quote{}, fmt.Errorf("clearing the previous attempt's "+
+				"cancelled invoice: %w", err)
+		}
+	}
+
+	if err := q.create(ctx, &terms, who, now); err != nil {
 		return Quote{}, err
 	}
 
 	return terms, nil
+}
+
+// previous decides what an earlier swap for the same payment hash means for a
+// new quote. It reports whether the previous attempt's cancelled invoice must
+// be deleted before a new one can be created.
+//
+// At most one swap per hash may be live. One that ended without paying the
+// invoice (failed, aborted, expired) gave the payer's money back, so quoting
+// again is safe and is the only way that invoice can ever be paid through this
+// bridge: the node keeps the cancelled hold invoice and would refuse a second
+// one for the same hash. The node is asked as well as the journal, because
+// compacting the journal drops finished swaps while the node keeps their
+// invoices.
+func (q *Quoter) previous(ctx context.Context, hash node.Hash) (bool, error) {
+	rec, err := q.Store.Get(ctx, hash)
+	switch {
+	case err == nil:
+		switch rec.State {
+		case swap.Failed, swap.Aborted, swap.Expired:
+			// Ended unpaid. The node is still asked below, because
+			// the record could say expired while the invoice was
+			// never cancelled, and that must not be deleted.
+		case swap.Settled:
+			return false, fmt.Errorf("%w: %w: %w: %x", ErrRefused,
+				ErrDuplicate, ErrAlreadyPaid, hash)
+		case swap.Lost:
+			return false, fmt.Errorf("%w: %w: %w: %x", ErrRefused,
+				ErrDuplicate, ErrNeedsOperator, hash)
+		default:
+			return false, fmt.Errorf("%w: %w: %w: %x is %v", ErrRefused,
+				ErrDuplicate, ErrInProgress, hash, rec.State)
+		}
+
+	case errors.Is(err, store.ErrNotFound):
+
+	default:
+		return false, fmt.Errorf("checking for an existing swap: %w", err)
+	}
+
+	inv, err := q.In.LookupInvoice(ctx, hash)
+	switch {
+	case errors.Is(err, node.ErrUnknownHash):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("checking the node for an earlier "+
+			"invoice: %w", err)
+	}
+
+	switch inv.State {
+	case node.InvoiceCancelled:
+		return true, nil
+	case node.InvoiceSettled:
+		return false, fmt.Errorf("%w: %w: %w: %x", ErrRefused, ErrDuplicate,
+			ErrAlreadyPaid, hash)
+	default:
+		// Open or held, with no live record: nothing here created it, or
+		// the journal lost it. Either way it is not this quote's to touch.
+		return false, fmt.Errorf("%w: %w: %w: the node holds an invoice "+
+			"for %x that is %v", ErrRefused, ErrDuplicate, ErrInProgress,
+			hash, inv.State)
+	}
 }
 
 // checkInvoice refuses what the bridge cannot safely deliver.
@@ -332,16 +549,30 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 	if dec.Hash == zero {
 		return fmt.Errorf("%w: the invoice carries no payment hash", ErrRefused)
 	}
+	if dec.BLAKE2b != q.PaysBLAKE2b {
+		// Checked first: every other rule below is about paying this
+		// invoice, and this one says it cannot be paid from here at all.
+		return fmt.Errorf("%w: %w", ErrRefused, ErrWrongChain)
+	}
+	for _, own := range q.Own {
+		if own != "" && strings.EqualFold(own, dec.Destination) {
+			return fmt.Errorf("%w: %w", ErrRefused, ErrSelfPayment)
+		}
+	}
 	if dec.AmountMsat == 0 {
 		// An invoice naming no amount would have the bridge choose what to
 		// send, and price the incoming leg against its own guess.
-		return fmt.Errorf("%w: the invoice names no amount", ErrRefused)
+		return fmt.Errorf("%w: %w", ErrRefused, ErrNoAmount)
 	}
-	if dec.AmountMsat < q.Policy.MinSwapMsat ||
-		dec.AmountMsat > q.Policy.MaxSwapMsat {
-
-		return fmt.Errorf("%w: %d msat is outside %d..%d", ErrRefused,
-			dec.AmountMsat, q.Policy.MinSwapMsat, q.Policy.MaxSwapMsat)
+	if dec.AmountMsat < q.Policy.MinSwapMsat {
+		return fmt.Errorf("%w: %w: %d msat is outside %d..%d", ErrRefused,
+			ErrTooSmall, dec.AmountMsat, q.Policy.MinSwapMsat,
+			q.Policy.MaxSwapMsat)
+	}
+	if dec.AmountMsat > q.Policy.MaxSwapMsat {
+		return fmt.Errorf("%w: %w: %d msat is outside %d..%d", ErrRefused,
+			ErrTooLarge, dec.AmountMsat, q.Policy.MinSwapMsat,
+			q.Policy.MaxSwapMsat)
 	}
 	if dec.Expiry.IsZero() {
 		// Every well-formed invoice carries a timestamp, so no expiry means
@@ -353,16 +584,16 @@ func (q *Quoter) checkInvoice(dec node.Decoded, now time.Time) error {
 		// Quoting against an invoice about to expire sells something the
 		// bridge may not be able to deliver: the payer funds the incoming
 		// leg and the outgoing one can no longer be paid.
-		return fmt.Errorf("%w: the invoice has %v left, less than the %v a "+
-			"quote needs", ErrRefused, dec.Expiry.Sub(now).Round(time.Second),
-			q.Policy.MinRemainingLife)
+		return fmt.Errorf("%w: %w: the invoice has %v left, less than the "+
+			"%v a quote needs", ErrRefused, ErrExpiresSoon,
+			dec.Expiry.Sub(now).Round(time.Second), q.Policy.MinRemainingLife)
 	}
 	if dec.CLTVDelta >= q.Policy.OutgoingCLTVLimit {
 		// The destination's own final-hop delta already fills the budget,
 		// leaving no blocks for the route in between.
-		return fmt.Errorf("%w: the destination wants %d blocks on the final "+
-			"hop and the whole route budget is %d", ErrRefused, dec.CLTVDelta,
-			q.Policy.OutgoingCLTVLimit)
+		return fmt.Errorf("%w: %w: the destination wants %d blocks on the "+
+			"final hop and the whole route budget is %d", ErrRefused,
+			ErrRouteBudget, dec.CLTVDelta, q.Policy.OutgoingCLTVLimit)
 	}
 
 	return nil
@@ -432,7 +663,9 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 // ever settle or cancel. Recording first makes that recoverable — the driver
 // finds a swap recorded as quoted whose invoice exists, and catches the record
 // up.
-func (q *Quoter) create(ctx context.Context, terms *Quote, now time.Time) error {
+func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
+	now time.Time) error {
+
 	rec := store.Record{
 		Hash:              terms.Hash,
 		State:             swap.Quoted,
@@ -446,6 +679,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, now time.Time) error 
 		Spread:            terms.Spread,
 		Created:           now,
 		Updated:           now,
+		Participant:       who,
 	}
 	if err := q.Store.Put(ctx, rec); err != nil {
 		return fmt.Errorf("recording the quote: %w", err)
@@ -459,7 +693,11 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, now time.Time) error 
 		Memo:       terms.Description,
 	})
 	if err != nil {
-		return fmt.Errorf("creating the hold invoice: %w", err)
+		// The record exists and the invoice may: a call that failed may
+		// still have reached the node. Only driving the swap settles which,
+		// so the caller is told to.
+		return fmt.Errorf("%w: creating the hold invoice: %w", ErrUntracked,
+			err)
 	}
 	terms.HoldInvoice = hold
 

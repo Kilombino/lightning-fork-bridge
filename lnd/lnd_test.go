@@ -56,6 +56,9 @@ type fakeNode struct {
 	settled   int
 	cancelled int
 
+	deleteErr error
+	deleted   []string
+
 	// payments is the sequence of updates a Send or Track stream emits, then
 	// streamErr if it is set, otherwise a clean end.
 	payments  []*lnrpc.Payment
@@ -115,6 +118,19 @@ func (f *fakeNode) CancelInvoice(context.Context, *invoicesrpc.CancelInvoiceMsg)
 	}
 
 	return &invoicesrpc.CancelInvoiceResp{}, nil
+}
+
+func (f *fakeNode) DeleteCanceledInvoice(_ context.Context,
+	r *lnrpc.DelCanceledInvoiceReq) (*lnrpc.DelCanceledInvoiceResp, error) {
+
+	f.deleted = append(f.deleted, r.GetInvoiceHash())
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
+	f.invoice, f.invoiceErr = nil, status.Error(codes.NotFound,
+		"there are no existing invoices")
+
+	return &lnrpc.DelCanceledInvoiceResp{}, nil
 }
 
 func (f *fakeNode) SendPaymentV2(r *routerrpc.SendPaymentRequest,
@@ -924,5 +940,102 @@ func TestDecodeRefusesWhatItCannotUse(t *testing.T) {
 		"lnbc1garbage"); !errors.Is(err, ErrInvoice) {
 
 		t.Errorf("undecodable: %v", err)
+	}
+}
+
+// TestDecodeReportsTheChainFromTheFeatureBits: the Bitcoin-side node does not
+// know option_blake2b, and a stock lnd still lists the bits an invoice sets,
+// marked unknown. That listing is how the bridge tells the chains apart, since
+// both nodes read both chains' invoices.
+func TestDecodeReportsTheChainFromTheFeatureBits(t *testing.T) {
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		name     string
+		features map[uint32]*lnrpc.Feature
+		want     bool
+	}{
+		{"none", nil, false},
+		{"ordinary bits", map[uint32]*lnrpc.Feature{
+			9: {Name: "tlv-onion"}, 15: {Name: "payment-addr"},
+		}, false},
+		{"required", map[uint32]*lnrpc.Feature{
+			512: {Name: "unknown", IsRequired: true},
+		}, true},
+		{"optional", map[uint32]*lnrpc.Feature{
+			513: {Name: "unknown"},
+		}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := &fakeNode{info: synced, payreq: &lnrpc.PayReq{
+				Destination: "03abc",
+				PaymentHash: hex.EncodeToString(make([]byte, 32)),
+				NumMsat:     1000, CltvExpiry: 40,
+				Timestamp: time.Now().Unix(), Expiry: 3600,
+				Features: c.features,
+			}}
+			got, err := NewOutgoing(serve(t, f)).Decode(ctx, "lnbc1fake")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.BLAKE2b != c.want {
+				t.Errorf("BLAKE2b %v, want %v", got.BLAKE2b, c.want)
+			}
+		})
+	}
+}
+
+// TestForgetOnlyACancelledInvoice: deleting anything else would erase the
+// record of an HTLC that is held or was paid.
+func TestForgetOnlyACancelledInvoice(t *testing.T) {
+	ctx := context.Background()
+	hash := node.Hash{9}
+
+	for _, st := range []lnrpc.Invoice_InvoiceState{
+		lnrpc.Invoice_OPEN, lnrpc.Invoice_ACCEPTED, lnrpc.Invoice_SETTLED,
+	} {
+		f := &fakeNode{info: synced, invoice: &lnrpc.Invoice{State: st}}
+		err := NewIncoming(serve(t, f)).ForgetInvoice(ctx, hash)
+		if err == nil {
+			t.Errorf("%v: forgotten", st)
+		}
+		if len(f.deleted) != 0 {
+			t.Errorf("%v: delete was called", st)
+		}
+	}
+
+	f := &fakeNode{info: synced, invoice: &lnrpc.Invoice{
+		State: lnrpc.Invoice_CANCELED,
+	}}
+	if err := NewIncoming(serve(t, f)).ForgetInvoice(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.deleted) != 1 || f.deleted[0] != hex.EncodeToString(hash[:]) {
+		t.Errorf("deleted %v", f.deleted)
+	}
+}
+
+// TestForgettingIsSafeToRepeat: after a crash between forgetting and quoting,
+// the next attempt finds nothing there, which is the outcome wanted.
+func TestForgettingIsSafeToRepeat(t *testing.T) {
+	ctx := context.Background()
+
+	f := &fakeNode{info: synced, invoiceErr: status.Error(codes.NotFound,
+		"there are no existing invoices")}
+	if err := NewIncoming(serve(t, f)).ForgetInvoice(ctx,
+		node.Hash{9}); err != nil {
+
+		t.Fatalf("an unknown hash should already count as forgotten: %v",
+			err)
+	}
+
+	// A delete that fails because the invoice vanished in between is also
+	// the outcome wanted.
+	f = &fakeNode{info: synced, invoice: &lnrpc.Invoice{
+		State: lnrpc.Invoice_CANCELED,
+	}, deleteErr: errors.New("raced")}
+	in := NewIncoming(serve(t, f))
+	if err := in.ForgetInvoice(ctx, node.Hash{9}); err == nil {
+		t.Fatal("a failed delete of an invoice still there must be reported")
 	}
 }

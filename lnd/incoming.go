@@ -2,6 +2,7 @@ package lnd
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -195,6 +196,42 @@ func (i *Incoming) CancelInvoice(ctx context.Context, hash node.Hash) error {
 	}
 
 	return fmt.Errorf("cancelling %x: %w", hash, err)
+}
+
+// ForgetInvoice deletes a cancelled invoice so its hash can be used again.
+//
+// The state is read first rather than left to the node to refuse: deleting
+// anything but a cancelled invoice would erase the record of an HTLC that is
+// held or was paid, and that is a decision this must never make by accident.
+// A hash the node has never seen is already forgotten, which is what makes
+// repeating this after a crash safe.
+func (i *Incoming) ForgetInvoice(ctx context.Context, hash node.Hash) error {
+	inv, err := i.LookupInvoice(ctx, hash)
+	switch {
+	case errors.Is(err, node.ErrUnknownHash):
+		return nil
+	case err != nil:
+		return fmt.Errorf("reading %x before forgetting it: %w", hash, err)
+	case inv.State != node.InvoiceCancelled:
+		return fmt.Errorf("%w: %x is %v, and only a cancelled invoice may "+
+			"be forgotten", ErrConfig, hash, inv.State)
+	}
+
+	_, err = i.main.DeleteCanceledInvoice(ctx, &lnrpc.DelCanceledInvoiceReq{
+		InvoiceHash: hex.EncodeToString(hash[:]),
+	})
+	if err == nil {
+		return nil
+	}
+
+	// Gone by the time it was asked for, which is the outcome wanted.
+	if _, lookupErr := i.LookupInvoice(ctx, hash); errors.Is(lookupErr,
+		node.ErrUnknownHash) {
+
+		return nil
+	}
+
+	return fmt.Errorf("forgetting %x: %w", hash, err)
 }
 
 // BlockHeight is the tip this node sees.

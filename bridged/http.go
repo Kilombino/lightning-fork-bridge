@@ -98,6 +98,14 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
+// writeRefusal reports a quote that did not happen, with the stable code a
+// client branches on next to the sentence a person reads.
+func writeRefusal(w http.ResponseWriter, code int, err error) {
+	writeJSON(w, code, map[string]string{
+		"error": err.Error(), "code": string(quote.CodeOf(err)),
+	})
+}
+
 func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 	var req QuoteRequest
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
@@ -122,15 +130,22 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.driveCtx(), 60*time.Second)
 	defer cancel()
 
-	sd, _, err := s.route(ctx, req.Invoice)
+	sd, decoded, err := s.route(ctx, req.Invoice)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeRefusal(w, http.StatusBadRequest, err)
 
 		return
 	}
 
 	terms, err := sd.quoter.Quote(ctx, req.Invoice)
 	if err != nil {
+		// The record exists and the invoice may: drive it, so that it
+		// either catches up or expires rather than holding its amount
+		// against the headroom until a restart.
+		if errors.Is(err, quote.ErrUntracked) {
+			s.drive(sd, decoded.Hash)
+		}
+
 		// A refusal is the bridge working, not failing: too large, too
 		// close to expiry, not enough headroom. It is the user's to act
 		// on, so it is a 4xx with the reason intact.
@@ -138,7 +153,7 @@ func (s *Service) handleQuote(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, quote.ErrRefused) {
 			code = http.StatusConflict
 		}
-		writeErr(w, code, err)
+		writeRefusal(w, code, err)
 
 		return
 	}

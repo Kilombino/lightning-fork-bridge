@@ -50,6 +50,10 @@ type side struct {
 	// invert is set on the direction whose rate is the reciprocal of the
 	// one the sources quote.
 	invert bool
+
+	// paysBLAKE2b is whether this direction pays out on the BLAKE2b chain,
+	// which is how an invoice is matched to its direction.
+	paysBLAKE2b bool
 }
 
 // Service is the running daemon.
@@ -93,6 +97,12 @@ type Service struct {
 	wg sync.WaitGroup
 
 	closers []func() error
+
+	// chainOf caches, per payment hash, whether a recorded swap pays out on
+	// the BLAKE2b chain, so headroom can be counted per direction without
+	// decoding every pending invoice on every quote.
+	chainMu sync.Mutex
+	chainOf map[node.Hash]bool
 }
 
 // New dials the nodes, opens the journal and wires both directions. It does
@@ -146,9 +156,27 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 	// zero, so start refused and let the first poll clear it.
 	s.priceErr = errors.New("no price has been read yet")
 
+	// The bridge's own two node keys, so neither can be paid through it.
+	var own []string
+	for _, conn := range []*grpc.ClientConn{s.lfConn, s.btcConn} {
+		info, err := lnrpc.NewLightningClient(conn).GetInfo(ctx,
+			&lnrpc.GetInfoRequest{})
+		if err != nil {
+			return fail(fmt.Errorf("reading a node's identity: %w", err))
+		}
+		own = append(own, info.GetIdentityPubkey())
+	}
+
+	// Both directions price against what the bridge holds on Bitcoin. That
+	// is the position the inventory policy describes: toBitcoin spends it,
+	// toBlake2b puts it back, and pricing toBlake2b against its own BTCB2
+	// balance instead would offer its biggest discount when the BTCB2 side
+	// was nearly empty, the opposite of what that side needs.
+	position := channelBalance(s.btcConn)
+
 	if cfg.ToBitcoin.Enabled {
 		s.sides = append(s.sides, s.build("toBitcoin", cfg.ToBitcoin,
-			s.lfConn, s.btcConn, inventory.Draining, false))
+			s.lfConn, s.btcConn, position, inventory.Draining, false, own))
 	} else {
 		s.disabled = append(s.disabled, "toBitcoin")
 	}
@@ -157,7 +185,8 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 		// BTCB2 uses the reciprocal. And it is the direction that puts
 		// back what the other one spends.
 		s.sides = append(s.sides, s.build("toBlake2b", cfg.ToBlake2b,
-			s.btcConn, s.lfConn, inventory.Replenishing, true))
+			s.btcConn, s.lfConn, position, inventory.Replenishing, true,
+			own))
 	} else {
 		s.disabled = append(s.disabled, "toBlake2b")
 	}
@@ -167,20 +196,25 @@ func New(ctx context.Context, cfg Config, log *slog.Logger) (*Service, error) {
 
 // build wires one direction. inConn receives and outConn pays.
 func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientConn,
-	dir inventory.Direction, invert bool) *side {
+	position func(context.Context) (uint64, error),
+	dir inventory.Direction, invert bool, own []string) *side {
 
 	sd := &side{
 		name: name, in: lnd.NewIncoming(inConn), out: lnd.NewOutgoing(outConn),
 		balance: channelBalance(outConn), dir: dir, invert: invert,
+		// The direction that inverts the rate is the one paying in BTCB2.
+		paysBLAKE2b: invert,
 	}
 
 	sd.quoter = &quote.Quoter{
 		In: sd.in, Out: sd.out, Store: s.journal,
-		Price:   s.pricer(sd, d.Inventory),
-		Spacing: quote.Rates(s.spacing(invert)),
-		Room:    s.headroom(sd),
-		Margin:  s.cfg.Margin,
-		Policy:  d.Policy,
+		Price:       s.pricer(sd, d.Inventory, position),
+		Spacing:     quote.Rates(s.spacing(invert)),
+		Room:        s.headroom(sd),
+		Margin:      s.cfg.Margin,
+		Policy:      d.Policy,
+		PaysBLAKE2b: sd.paysBLAKE2b,
+		Own:         own,
 	}
 	sd.runner = &runner.Runner{
 		Driver: &driver.Driver{
@@ -200,7 +234,9 @@ func (s *Service) build(name string, d Direction, inConn, outConn *grpc.ClientCo
 // outgoing side is, and both are reasons to charge more. Taking the larger
 // charges enough for whichever risk is bigger; taking either alone would
 // underprice the other.
-func (s *Service) pricer(sd *side, inv inventory.Policy) quote.Pricer {
+func (s *Service) pricer(sd *side, inv inventory.Policy,
+	position func(context.Context) (uint64, error)) quote.Pricer {
+
 	return func(ctx context.Context) (rate.Reading, error) {
 		s.priceMu.RLock()
 		r, err := s.price, s.priceErr
@@ -231,9 +267,10 @@ func (s *Service) pricer(sd *side, inv inventory.Policy) quote.Pricer {
 			r.OutgoingPerIncoming = 1 / r.OutgoingPerIncoming
 		}
 
-		held, err := sd.balance(ctx)
+		held, err := position(ctx)
 		if err != nil {
-			return rate.Reading{}, err
+			return rate.Reading{}, fmt.Errorf("%w: %w", quote.ErrRefused,
+				err)
 		}
 		pos, err := inv.Spread(inventory.State{
 			OutgoingMsat: held, At: time.Now(),
@@ -271,7 +308,10 @@ func (s *Service) headroom(sd *side) quote.Headroom {
 		if err != nil {
 			return 0, err
 		}
-		committed, err := store.Committed(ctx, s.journal)
+		committed, err := store.CommittedWhere(ctx, s.journal,
+			func(r store.Record) bool {
+				return s.paysBLAKE2b(ctx, sd, r) == sd.paysBLAKE2b
+			})
 		if err != nil {
 			return 0, err
 		}
@@ -281,6 +321,37 @@ func (s *Service) headroom(sd *side) quote.Headroom {
 
 		return held - committed, nil
 	}
+}
+
+// paysBLAKE2b reports whether a recorded swap pays out on the BLAKE2b chain,
+// by reading its outgoing invoice once and remembering the answer.
+//
+// An invoice that cannot be read is counted against the asking side. That
+// over-reserves, which refuses a quote it need not have; the other way
+// under-reserves, which sells the same money twice.
+func (s *Service) paysBLAKE2b(ctx context.Context, sd *side,
+	r store.Record) bool {
+
+	s.chainMu.Lock()
+	if s.chainOf == nil {
+		s.chainOf = map[node.Hash]bool{}
+	}
+	known, ok := s.chainOf[r.Hash]
+	s.chainMu.Unlock()
+	if ok {
+		return known
+	}
+
+	dec, err := sd.out.Decode(ctx, r.Invoice)
+	if err != nil {
+		return sd.paysBLAKE2b
+	}
+
+	s.chainMu.Lock()
+	s.chainOf[r.Hash] = dec.BLAKE2b
+	s.chainMu.Unlock()
+
+	return dec.BLAKE2b
 }
 
 // spacing reports both chains' block spacing, with the legs the right way
@@ -355,10 +426,21 @@ func (s *Service) route(ctx context.Context, invoice string) (*side, node.Decode
 	var last error
 	for _, sd := range s.sides {
 		dec, err := sd.out.Decode(ctx, invoice)
-		if err == nil {
-			return sd, dec, nil
+		if err != nil {
+			last = err
+
+			continue
 		}
-		last = err
+		// Both chains' invoices share a prefix and both nodes read every
+		// one, so decoding says nothing about the chain. option_blake2b
+		// does.
+		if dec.BLAKE2b != sd.paysBLAKE2b {
+			last = quote.ErrWrongChain
+
+			continue
+		}
+
+		return sd, dec, nil
 	}
 
 	// Say so if the direction exists and is switched off, which is the
@@ -372,6 +454,12 @@ func (s *Service) route(ctx context.Context, invoice string) (*side, node.Decode
 
 	if last == nil {
 		return nil, node.Decoded{}, ErrNoDirection
+	}
+
+	// No node could read it at all, as opposed to every node reading it as
+	// the other chain's: that is an invoice problem, not a direction one.
+	if !errors.Is(last, quote.ErrWrongChain) {
+		last = fmt.Errorf("%w: %w", quote.ErrInvalidInvoice, last)
 	}
 
 	return nil, node.Decoded{}, fmt.Errorf("%w: %w", ErrNoDirection, last)

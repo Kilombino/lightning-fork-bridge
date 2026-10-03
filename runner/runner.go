@@ -39,6 +39,11 @@ var (
 	ErrConfig = errors.New("runner is not usable")
 )
 
+// DefaultFundedGrace is how long a funded swap may wait to be paid past its
+// quote's expiry. Long enough to ride out a node restart, short enough that
+// the price it pays at is still recent.
+const DefaultFundedGrace = 10 * time.Minute
+
 // DefaultPoll is how often the nodes are asked what changed.
 //
 // Polling rather than subscribing, because the thing being watched moves at
@@ -64,6 +69,17 @@ type Runner struct {
 	// PayTimeout bounds one outgoing attempt. Zero means two minutes.
 	PayTimeout time.Duration
 
+	// FundedGrace is how long past its quote's expiry a funded swap may wait
+	// to be paid before it is given back instead. Zero means
+	// DefaultFundedGrace.
+	//
+	// A funded swap normally pays within seconds. One that cannot, because
+	// a chain cannot be measured or a node is not answering, would
+	// otherwise wait with the payer's HTLC locked for as long as the
+	// condition lasts, and then pay at a price struck long before. Giving
+	// it back is free for both sides: nothing has been sent.
+	FundedGrace time.Duration
+
 	// Poll overrides DefaultPoll.
 	Poll time.Duration
 
@@ -83,6 +99,14 @@ func (r *Runner) now() time.Time {
 	}
 
 	return time.Now()
+}
+
+func (r *Runner) fundedGrace() time.Duration {
+	if r.FundedGrace > 0 {
+		return r.FundedGrace
+	}
+
+	return DefaultFundedGrace
 }
 
 func (r *Runner) poll() time.Duration {
@@ -272,6 +296,22 @@ func (r *Runner) step(ctx context.Context, sw *driver.Swap,
 		return false, nil
 
 	case swap.Funded:
+		// Before the gate, and whether or not the gate could run: the
+		// case this exists for is the one where it cannot.
+		if !sw.QuoteExpiry.IsZero() &&
+			!r.now().Before(sw.QuoteExpiry.Add(r.fundedGrace())) {
+
+			log.Warn("funded too long without paying; giving it back",
+				"quote_expiry", sw.QuoteExpiry)
+
+			action, err := r.apply(ctx, sw, swap.QuoteExpired, log)
+			if err != nil {
+				return false, err
+			}
+
+			return true, r.carryOut(ctx, sw, action, log)
+		}
+
 		return r.gate(ctx, sw, log)
 
 	case swap.Paying:

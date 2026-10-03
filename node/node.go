@@ -189,6 +189,17 @@ type Incoming interface {
 	// CancelInvoice returns the HTLC. It is idempotent.
 	CancelInvoice(ctx context.Context, hash Hash) error
 
+	// ForgetInvoice deletes a cancelled invoice, so that its payment hash can
+	// carry a new one.
+	//
+	// It exists for quoting an invoice again after an attempt ended without
+	// paying it: a node keeps cancelled invoices and refuses a second one
+	// for the same hash, which would leave that destination unpayable
+	// through the bridge for good. It must refuse an invoice that is not
+	// cancelled, and succeed for one the node has never seen, so that
+	// repeating it after a crash is harmless.
+	ForgetInvoice(ctx context.Context, hash Hash) error
+
 	// BlockHeight is the tip this node sees, used to turn an expiry height
 	// into blocks remaining.
 	BlockHeight(ctx context.Context) (int32, error)
@@ -219,7 +230,18 @@ type Decoded struct {
 
 	// Description is what the payer will see quoted back to them.
 	Description string
+
+	// BLAKE2b is whether the invoice sets option_blake2b (feature bit 512 or
+	// 513), which every invoice issued on the BLAKE2b chain does.
+	//
+	// It is how a direction is chosen. Both chains' invoices share the same
+	// prefix, so both nodes can read every invoice, and "which node can
+	// decode it" no longer says which chain it is for.
+	BLAKE2b bool
 }
+
+// BLAKE2bFeatureBits are option_blake2b's required and optional bits.
+var BLAKE2bFeatureBits = [2]uint32{512, 513}
 
 // Outgoing is the node the bridge pays on.
 type Outgoing interface {

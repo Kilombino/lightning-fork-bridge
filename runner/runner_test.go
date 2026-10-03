@@ -94,6 +94,8 @@ func (f *fakeIn) SettleInvoice(context.Context, node.Preimage) error {
 	return nil
 }
 
+func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error { return nil }
+
 func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -333,10 +335,11 @@ func TestAnUnfundedQuoteLapses(t *testing.T) {
 	}
 }
 
-// TestAFundedSwapIsNotJudgedOnPrice. Once an HTLC is locked in the question is
-// blocks, not minutes: expiring it on the quote clock would throw away a claim
-// the margin check says is perfectly safe.
-func TestAFundedSwapIsNotJudgedOnPrice(t *testing.T) {
+// TestAFundedSwapIsPaidWithinItsGrace: a swap funded before its quote
+// expired is still paid shortly after, because funding is what the quote
+// asked for and a node taking a few seconds to answer is not the payer's
+// fault.
+func TestAFundedSwapIsPaidWithinItsGrace(t *testing.T) {
 	ctx, cancel := deadline(t)
 	defer cancel()
 
@@ -348,7 +351,7 @@ func TestAFundedSwapIsNotJudgedOnPrice(t *testing.T) {
 		State: node.PaymentSucceeded, Preimage: preimage,
 	}}
 	rec := record(swap.Funded)
-	rec.QuoteExpiry = now.Add(-time.Hour) // long gone
+	rec.QuoteExpiry = now.Add(-DefaultFundedGrace / 2)
 	r, st := build(t, in, out, rec)
 
 	if err := r.Drive(ctx, hash); err != nil {
@@ -357,7 +360,76 @@ func TestAFundedSwapIsNotJudgedOnPrice(t *testing.T) {
 
 	final, _ := st.Get(context.Background(), hash)
 	if final.State != swap.Settled {
-		t.Fatalf("ended in %v; a funded swap was judged on the quote clock",
+		t.Fatalf("ended in %v; a swap inside its grace should be paid",
+			final.State)
+	}
+}
+
+// TestAFundedSwapPastItsGraceIsGivenBack is the bound on how long a payer's
+// HTLC can be held for nothing. Past the grace the swap is cancelled rather
+// than paid, and above all nothing is sent: the case this exists for is a
+// bridge that cannot measure a chain, where paying would be a decision made
+// without the margin check.
+func TestAFundedSwapPastItsGraceIsGivenBack(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}
+	rec := record(swap.Funded)
+	rec.QuoteExpiry = now.Add(-DefaultFundedGrace - time.Second)
+	r, st := build(t, in, out, rec)
+	// The measurement is down, which is the situation in question.
+	r.Rates = func(context.Context) (driver.Rates, error) {
+		return driver.Rates{}, errors.New("cannot measure")
+	}
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v, want aborted", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Fatalf("paid %d times; a swap past its grace must not pay", n)
+	}
+	if _, cancelled := in.counts(); cancelled != 1 {
+		t.Fatalf("cancelled %d times, want once", cancelled)
+	}
+}
+
+// TestTheGraceIsConfigurable: an operator who wants a tighter or looser bound
+// gets it.
+func TestTheGraceIsConfigurable(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}
+	rec := record(swap.Funded)
+	rec.QuoteExpiry = now.Add(-2 * time.Minute)
+	r, st := build(t, in, out, rec)
+	r.FundedGrace = time.Minute
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v, want aborted under a one-minute grace",
 			final.State)
 	}
 }

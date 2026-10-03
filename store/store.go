@@ -115,6 +115,16 @@ type Record struct {
 
 	// Note is free text. The states that need a human carry the reason here.
 	Note string
+
+	// Participant is who asked for this swap, when the bridge serves more
+	// than its operator: an opaque identifier of their credential. Empty for
+	// the operator's own swaps.
+	//
+	// It is recorded so that per-participant limits survive a restart. A
+	// limit that forgot every outstanding quote at each start would let a
+	// participant reserve the bridge's liquidity again simply by waiting
+	// for one.
+	Participant string
 }
 
 // Valid reports whether a record can be stored. It is deliberately narrow:
@@ -239,6 +249,19 @@ type Store interface {
 // there is no chance to re-decide. Paid is excluded because by then the
 // payment has left and the balance already reflects it.
 func Committed(ctx context.Context, s Store) (uint64, error) {
+	return CommittedWhere(ctx, s, nil)
+}
+
+// CommittedWhere is Committed over the records keep accepts, or all of them
+// when keep is nil.
+//
+// A bridge serving both directions needs it per direction. The two pay out on
+// different chains, in units that are not the same, so a sum across both is
+// not an amount of anything: it reserves too much on one side and too little
+// on the other.
+func CommittedWhere(ctx context.Context, s Store,
+	keep func(Record) bool) (uint64, error) {
+
 	pending, err := s.Pending(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("reading pending swaps: %w", err)
@@ -246,6 +269,9 @@ func Committed(ctx context.Context, s Store) (uint64, error) {
 
 	var total uint64
 	for _, r := range pending {
+		if keep != nil && !keep(r) {
+			continue
+		}
 		switch r.State {
 		case swap.Quoted, swap.Offered, swap.Funded, swap.Paying:
 			// Saturating, because an overflow here would report a small

@@ -1041,3 +1041,85 @@ func TestAnOutgoingPreimageForSomeOtherPayment(t *testing.T) {
 		t.Errorf("hash-linked: want ErrRecord, got %v", err)
 	}
 }
+
+// TestTheParticipantSurvivesTheJournal: per-participant limits are counted
+// from the journal, so a restart, or a compaction, must not lose who asked.
+func TestTheParticipantSurvivesTheJournal(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+
+	j := open(t, path)
+	r := rec(1, swap.Offered)
+	r.Participant = "1a2b3c"
+	if err := j.Put(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	operator := rec(2, swap.Offered)
+	if err := j.Put(ctx, operator); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Compact(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	j = open(t, path)
+	defer j.Close()
+	got, err := j.Get(ctx, r.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Participant != "1a2b3c" {
+		t.Errorf("participant %q after a reopen", got.Participant)
+	}
+	got, err = j.Get(ctx, operator.Hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Participant != "" {
+		t.Errorf("the operator's swap came back as %q", got.Participant)
+	}
+}
+
+// TestCommittedWhereCountsOnlyWhatItIsAsked: per direction, the two chains'
+// amounts are never summed into one number.
+func TestCommittedWhereCountsOnlyWhatItIsAsked(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+
+	a := rec(1, swap.Offered)
+	a.OutgoingMsat = 100
+	a.Note = "bitcoin"
+	b := rec(2, swap.Funded)
+	b.OutgoingMsat = 7_000
+	b.Note = "blake2b"
+	for _, r := range []Record{a, b} {
+		if err := m.Put(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	only := func(note string) func(Record) bool {
+		return func(r Record) bool { return r.Note == note }
+	}
+	for note, want := range map[string]uint64{"bitcoin": 100,
+		"blake2b": 7_000} {
+
+		got, err := CommittedWhere(ctx, m, only(note))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s: %d, want %d", note, got, want)
+		}
+	}
+	all, err := Committed(ctx, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all != 7_100 {
+		t.Errorf("unfiltered %d, want 7100", all)
+	}
+}

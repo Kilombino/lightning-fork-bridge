@@ -47,6 +47,8 @@ func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error {
 	return nil
 }
 
+func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error { return nil }
+
 func (f *fakeIn) BlockHeight(context.Context) (int32, error) {
 	return f.height, f.heightErr
 }

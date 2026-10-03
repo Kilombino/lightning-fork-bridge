@@ -194,7 +194,7 @@ func TestSamplePriceRefusesWhenEverySourceFails(t *testing.T) {
 	sd := &side{name: "toBitcoin", balance: func(context.Context) (uint64, error) {
 		return 1, nil
 	}}
-	if _, err := s.pricer(sd, inventoryForTest())(context.Background()); err == nil {
+	if _, err := s.pricer(sd, inventoryForTest(), sd.balance)(context.Background()); err == nil {
 		t.Error("a quote should be refused while there is no usable price")
 	}
 }
@@ -208,14 +208,14 @@ func TestResumeRoutesEachSwapToItsOwnDirection(t *testing.T) {
 	j := openJournal(t, t.TempDir())
 	defer j.Close()
 
-	btc := &fakeOut{accepts: "lnbc"}
-	lf := &fakeOut{accepts: "lnblake"}
+	btc := &fakeOut{accepts: "ln"}
+	lf := &fakeOut{accepts: "ln"}
 	s := testService(t, btc, lf, nil)
 	s.journal = j
 
 	// Two unfinished swaps, one for each direction.
 	now := time.Now()
-	for i, invoice := range []string{"lnbcrt1payme", "lnblakert1payme"} {
+	for i, invoice := range []string{"lnbcrt1payme", "lnbcrt1" + b2bMarker + "payme"} {
 		err := j.Put(context.Background(), store.Record{
 			Hash: node8(byte(i + 1)), State: swap.Offered,
 			OutgoingCLTVLimit: 40, Invoice: invoice,

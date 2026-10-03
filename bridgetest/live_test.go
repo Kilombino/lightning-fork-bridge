@@ -567,6 +567,8 @@ func labQuoterReverse(t *testing.T, in *lnd.Incoming, out *lnd.Outgoing,
 			return held - committed, nil
 		},
 		Margin: labMargin,
+		// This direction pays the user's BLAKE2b invoice.
+		PaysBLAKE2b: true,
 		Policy: quote.Policy{
 			MinSwapMsat: 1_000, MaxSwapMsat: 500_000_000,
 			Validity: 2 * time.Minute, InvoiceExpiry: 10 * time.Minute,

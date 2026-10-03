@@ -286,5 +286,15 @@ func (o *Outgoing) Decode(ctx context.Context, invoice string) (node.Decoded,
 	out.Destination = req.GetDestination()
 	out.Description = req.GetDescription()
 
+	// Read from the feature map whether or not this node knows the bit. A
+	// stock lnd reports bits it does not understand too, marked unknown,
+	// and that is exactly the case here: the Bitcoin-side node must still
+	// be able to tell that an invoice is for the other chain.
+	for _, bit := range node.BLAKE2bFeatureBits {
+		if _, ok := req.GetFeatures()[bit]; ok {
+			out.BLAKE2b = true
+		}
+	}
+
 	return out, nil
 }

@@ -31,6 +31,27 @@ var (
 type fakeIn struct {
 	asked  *node.HoldInvoice
 	addErr error
+
+	// existing is what the node already holds for the hash, if anything,
+	// and lookupErr a failure to say.
+	existing  *node.Invoice
+	lookupErr error
+
+	forgotten int
+	forgetErr error
+}
+
+func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error {
+	if f.forgetErr != nil {
+		return f.forgetErr
+	}
+	if f.existing != nil && f.existing.State != node.InvoiceCancelled {
+		return errors.New("only a cancelled invoice may be forgotten")
+	}
+	f.forgotten++
+	f.existing = nil
+
+	return nil
 }
 
 func (f *fakeIn) AddHoldInvoice(_ context.Context, r node.HoldInvoice) (string,
@@ -46,6 +67,13 @@ func (f *fakeIn) AddHoldInvoice(_ context.Context, r node.HoldInvoice) (string,
 
 func (f *fakeIn) LookupInvoice(context.Context, node.Hash) (node.Invoice,
 	error) {
+
+	if f.lookupErr != nil {
+		return node.Invoice{}, f.lookupErr
+	}
+	if f.existing != nil {
+		return *f.existing, nil
+	}
 
 	return node.Invoice{}, node.ErrUnknownHash
 }
@@ -603,6 +631,8 @@ func TestConcurrentQuotesForOneHash(t *testing.T) {
 type slowIn struct {
 	created atomic.Int32
 }
+
+func (s *slowIn) ForgetInvoice(context.Context, node.Hash) error { return nil }
 
 func (s *slowIn) AddHoldInvoice(context.Context, node.HoldInvoice) (string,
 	error) {

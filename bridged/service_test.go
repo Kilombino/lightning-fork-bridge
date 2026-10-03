@@ -15,6 +15,7 @@ import (
 	"github.com/paulscode/lightning-fork-bridge/inventory"
 	"github.com/paulscode/lightning-fork-bridge/margin"
 	"github.com/paulscode/lightning-fork-bridge/node"
+	"github.com/paulscode/lightning-fork-bridge/quote"
 	"github.com/paulscode/lightning-fork-bridge/rate"
 	"github.com/paulscode/lightning-fork-bridge/store"
 	"github.com/paulscode/lightning-fork-bridge/swap"
@@ -27,23 +28,30 @@ func quiet() *slog.Logger {
 
 // fakeOut answers Decode and nothing else, which is all routing needs.
 type fakeOut struct {
-	// accepts is the invoice prefix this node will read. A real node
-	// refuses an invoice for another chain, which is exactly what routing
-	// depends on.
+	// accepts is the invoice prefix this node will read. Both chains'
+	// invoices share a prefix, so in practice each node reads every
+	// Lightning invoice and refuses only something that is not one.
 	accepts string
 	decoded node.Decoded
 	calls   int
 }
+
+// b2bMarker in a test invoice stands for option_blake2b being set, which is
+// how a real node's decoder reports an invoice issued on the BLAKE2b chain.
+const b2bMarker = "b2b"
 
 func (f *fakeOut) Decode(_ context.Context, invoice string) (node.Decoded, error) {
 	f.calls++
 	if f.accepts == "" || len(invoice) < len(f.accepts) ||
 		invoice[:len(f.accepts)] != f.accepts {
 
-		return node.Decoded{}, errors.New("not an invoice for this chain")
+		return node.Decoded{}, errors.New("not a Lightning invoice")
 	}
 
-	return f.decoded, nil
+	d := f.decoded
+	d.BLAKE2b = strings.Contains(invoice, b2bMarker)
+
+	return d, nil
 }
 
 func (f *fakeOut) Pay(context.Context, node.PayRequest) (node.Payment, error) {
@@ -78,20 +86,22 @@ func testService(t *testing.T, toBitcoin, toBlake2b *fakeOut,
 	if toBlake2b != nil {
 		s.sides = append(s.sides, &side{
 			name: "toBlake2b", out: toBlake2b, balance: balance,
-			dir: inventory.Replenishing, invert: true,
+			dir: inventory.Replenishing, invert: true, paysBLAKE2b: true,
 		})
 	}
 
 	return s
 }
 
-// Routing by asking the nodes is the whole reason there is no second parser
-// in this process, so it is worth testing that it actually discriminates.
-func TestRouteAsksTheNodes(t *testing.T) {
+// Both chains' invoices share a prefix and both nodes read every one, so the
+// direction has to come from what the invoice says about its chain. This is
+// the regression for routing by "which node can decode it", which sent every
+// BLAKE2b invoice to the Bitcoin side once the prefixes became the same.
+func TestRouteGoesByTheChainNotTheDecoder(t *testing.T) {
 	t.Parallel()
 
-	btc := &fakeOut{accepts: "lnbc"}
-	lf := &fakeOut{accepts: "lnblake"}
+	btc := &fakeOut{accepts: "ln"}
+	lf := &fakeOut{accepts: "ln"}
 	s := testService(t, btc, lf, nil)
 
 	tests := []struct {
@@ -99,17 +109,21 @@ func TestRouteAsksTheNodes(t *testing.T) {
 		want    string
 	}{
 		{invoice: "lnbcrt1500n1p4invoice", want: "toBitcoin"},
-		{invoice: "lnblakert1m1p4invoice", want: "toBlake2b"},
+		{invoice: "lnbcrt1m1p4" + b2bMarker + "invoice", want: "toBlake2b"},
 	}
 
 	for _, test := range tests {
-		sd, _, err := s.route(context.Background(), test.invoice)
+		sd, dec, err := s.route(context.Background(), test.invoice)
 		if err != nil {
 			t.Fatalf("%s: %v", test.invoice, err)
 		}
 		if sd.name != test.want {
 			t.Errorf("%s routed to %s, wanted %s", test.invoice, sd.name,
 				test.want)
+		}
+		if dec.BLAKE2b != sd.paysBLAKE2b {
+			t.Errorf("%s: routed to a side paying on the other chain",
+				test.invoice)
 		}
 	}
 }
@@ -131,12 +145,18 @@ func TestRouteRefusesAnInvoiceNeitherNodeReads(t *testing.T) {
 func TestRouteWillNotUseADisabledDirection(t *testing.T) {
 	t.Parallel()
 
-	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
+	s := testService(t, &fakeOut{accepts: "ln"}, nil, nil)
 
-	_, _, err := s.route(context.Background(), "lnblakert1m1p4invoice")
+	_, _, err := s.route(context.Background(),
+		"lnbcrt1m1p4"+b2bMarker+"invoice")
 	if !errors.Is(err, ErrNoDirection) {
 		t.Fatalf("a BLAKE2b invoice should be unroutable with only "+
 			"toBitcoin enabled, got %v", err)
+	}
+	// And the reason is the chain, which is what a payer is told.
+	if quote.CodeOf(err) != quote.CodeNoDirection {
+		t.Errorf("code %q, want %q", quote.CodeOf(err),
+			quote.CodeNoDirection)
 	}
 }
 
@@ -159,11 +179,11 @@ func TestPricerInvertsForTheReverseDirection(t *testing.T) {
 	inv.TargetOutgoingMsat = 1_000_000_000
 	inv.FloorOutgoingMsat = 100_000_000
 
-	forward, err := s.pricer(s.sides[0], inv)(context.Background())
+	forward, err := s.pricer(s.sides[0], inv, s.sides[0].balance)(context.Background())
 	if err != nil {
 		t.Fatalf("forward: %v", err)
 	}
-	reverse, err := s.pricer(s.sides[1], inv)(context.Background())
+	reverse, err := s.pricer(s.sides[1], inv, s.sides[1].balance)(context.Background())
 	if err != nil {
 		t.Fatalf("reverse: %v", err)
 	}
@@ -191,7 +211,7 @@ func TestPricerRefusesBeforeAnyPrice(t *testing.T) {
 	s := testService(t, &fakeOut{accepts: "lnbc"}, nil, nil)
 	s.priceErr = errors.New("no price has been read yet")
 
-	if _, err := s.pricer(s.sides[0], inventory.DefaultPolicy)(
+	if _, err := s.pricer(s.sides[0], inventory.DefaultPolicy, s.sides[0].balance)(
 		context.Background()); err == nil {
 
 		t.Fatal("a quote before the first price should be refused")
@@ -208,7 +228,7 @@ func TestPricerRefusesToInvertAnUnusableRate(t *testing.T) {
 		s.price = rate.Reading{OutgoingPerIncoming: bad, At: time.Now()}
 		s.priceErr = nil
 
-		_, err := s.pricer(s.sides[0], inventory.DefaultPolicy)(
+		_, err := s.pricer(s.sides[0], inventory.DefaultPolicy, s.sides[0].balance)(
 			context.Background())
 		if err == nil {
 			t.Errorf("inverting %g should be refused", bad)
@@ -257,7 +277,7 @@ func TestSpreadTakesTheWiderOfTheTwo(t *testing.T) {
 			}
 			s.priceErr = nil
 
-			got, err := s.pricer(s.sides[0], inv)(context.Background())
+			got, err := s.pricer(s.sides[0], inv, s.sides[0].balance)(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -478,7 +498,7 @@ func TestPricerRefusesAPriceThatStoppedBeingRefreshed(t *testing.T) {
 		OutgoingPerIncoming: 0.003, At: time.Now().Add(-30 * time.Second),
 		Sources: 2, Spread: 0.01,
 	}
-	if _, err := s.pricer(s.sides[0], inventoryForTest())(
+	if _, err := s.pricer(s.sides[0], inventoryForTest(), s.sides[0].balance)(
 		context.Background()); err != nil {
 
 		t.Fatalf("a price inside MaxAge should be usable: %v", err)
@@ -486,7 +506,7 @@ func TestPricerRefusesAPriceThatStoppedBeingRefreshed(t *testing.T) {
 
 	// Older than the policy allows: refused, and the reason says why.
 	s.price.At = time.Now().Add(-10 * time.Minute)
-	_, err := s.pricer(s.sides[0], inventoryForTest())(context.Background())
+	_, err := s.pricer(s.sides[0], inventoryForTest(), s.sides[0].balance)(context.Background())
 	if err == nil {
 		t.Fatal("a price older than MaxAge should be refused")
 	}
@@ -512,5 +532,49 @@ func TestRouteNamesADisabledDirection(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not enabled") {
 		t.Errorf("the refusal should say it is switched off: %v", err)
+	}
+}
+
+// TestHeadroomIsCountedPerDirection: a swap paying out on one chain is no
+// claim on the other chain's balance. Summing both would refuse quotes the
+// bridge could pay on one side and sell the same money twice on the other.
+func TestHeadroomIsCountedPerDirection(t *testing.T) {
+	t.Parallel()
+
+	j := openJournal(t, t.TempDir())
+	defer j.Close()
+
+	s := testService(t, &fakeOut{accepts: "ln"}, &fakeOut{accepts: "ln"},
+		func(context.Context) (uint64, error) { return 1_000_000, nil })
+	s.journal = j
+
+	now := time.Now()
+	for i, r := range []struct {
+		invoice string
+		msat    uint64
+	}{
+		{"lnbcrt1tobitcoin", 300_000},
+		{"lnbcrt1" + b2bMarker + "toblake2b", 900_000},
+	} {
+		err := j.Put(context.Background(), store.Record{
+			Hash: node.Hash{byte(i + 1)}, State: swap.Offered,
+			OutgoingCLTVLimit: 40, Invoice: r.invoice,
+			IncomingMsat: 1, OutgoingMsat: r.msat,
+			Rate: 0.003, Spread: 0.01, Created: now, Updated: now,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i, want := range []uint64{700_000, 100_000} {
+		room, err := s.headroom(s.sides[i])(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if room != want {
+			t.Errorf("%s: headroom %d, want %d", s.sides[i].name, room,
+				want)
+		}
 	}
 }

@@ -50,7 +50,9 @@ func (f *fakeIn) LookupInvoice(context.Context, node.Hash) (node.Invoice, error)
 }
 func (f *fakeIn) SettleInvoice(context.Context, node.Preimage) error { return nil }
 func (f *fakeIn) CancelInvoice(context.Context, node.Hash) error     { return nil }
-func (f *fakeIn) BlockHeight(context.Context) (int32, error)         { return 500, nil }
+func (f *fakeIn) ForgetInvoice(context.Context, node.Hash) error     { return nil }
+
+func (f *fakeIn) BlockHeight(context.Context) (int32, error) { return 500, nil }
 
 // quotableService is a service whose one direction can actually produce a
 // quote, so the handlers can be exercised without two Lightning nodes.
@@ -98,7 +100,7 @@ func quotableService(t *testing.T) *Service {
 	marg := margin.Policy{Settlement: time.Hour, MaxIncomingBlocks: 2016}
 	sd.quoter = &quote.Quoter{
 		In: sd.in, Out: sd.out, Store: j,
-		Price:   s.pricer(sd, inventory.DefaultPolicy),
+		Price:   s.pricer(sd, inventory.DefaultPolicy, sd.balance),
 		Spacing: quote.Rates(s.spacing(false)),
 		Room:    s.headroom(sd),
 		Margin:  marg,
@@ -497,4 +499,58 @@ func TestHealthReportsAMissingJournal(t *testing.T) {
 	if !strings.Contains(w.Body.String(), `"journal"`) {
 		t.Errorf("health should name the journal: %s", w.Body.String())
 	}
+}
+
+// TestARefusalCarriesItsCode: a client branches on the code and shows the
+// sentence, so both have to be there.
+func TestARefusalCarriesItsCode(t *testing.T) {
+	t.Parallel()
+
+	s := quotableService(t)
+	s.sides[0].quoter.Policy.MaxSwapMsat = 1_000_000
+	w := post(t, s.Handler(), `{"invoice":"lnbcrt1500n1p4invoice"}`)
+
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["code"] != string(quote.CodeTooLarge) {
+		t.Errorf("code %q, want %q", body["code"], quote.CodeTooLarge)
+	}
+	if body["error"] == "" {
+		t.Error("no sentence")
+	}
+}
+
+// TestAnUntrackedSwapIsDriven: the record exists and the hold invoice may, so
+// the daemon drives it rather than leaving its amount reserved until a
+// restart. Driving it here, with nothing on the node, lets it expire.
+func TestAnUntrackedSwapIsDriven(t *testing.T) {
+	t.Parallel()
+
+	s := quotableService(t)
+	sd := s.sides[0]
+	in := &fakeIn{addErr: errors.New("timed out")}
+	sd.in = in
+	sd.quoter.In = in
+	sd.runner.Driver.In = in
+	expired := time.Now().Add(-time.Second)
+	sd.quoter.Now = func() time.Time { return expired.Add(-quote.DefaultPolicy.Validity) }
+
+	w := post(t, s.Handler(), `{"invoice":"lnbcrt1500n1p4invoice"}`)
+	if w.Code == http.StatusOK {
+		t.Fatalf("a failed hold invoice was reported as a quote")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, err := s.journal.Get(context.Background(), testHash)
+		if err == nil && rec.State == swap.Expired {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rec, _ := s.journal.Get(context.Background(), testHash)
+	t.Fatalf("the untracked swap was left %v; it should have been driven "+
+		"to expired", rec.State)
 }

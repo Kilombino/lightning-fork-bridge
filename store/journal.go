@@ -44,6 +44,7 @@ type wire struct {
 	Created   time.Time `json:"created"`
 	Updated   time.Time `json:"updated"`
 	Note      string    `json:"note,omitempty"`
+	Who       string    `json:"participant,omitempty"`
 }
 
 func toWire(r Record) wire {
@@ -62,6 +63,7 @@ func toWire(r Record) wire {
 		Created:   r.Created,
 		Updated:   r.Updated,
 		Note:      r.Note,
+		Who:       r.Participant,
 	}
 	var zeroPre node.Preimage
 	if r.Preimage != zeroPre {
@@ -142,6 +144,7 @@ func (w wire) record() (Record, error) {
 	r.Created = w.Created
 	r.Updated = w.Updated
 	r.Note = w.Note
+	r.Participant = w.Who
 
 	return r, nil
 }

@@ -181,6 +181,16 @@ a swap quoted before a restart is picked up by the next process, driven when
 the user pays it afterwards, and settled. Recovery is not a claim about the
 journal here, it is something that happened.
 
+Since then, three things changed what a quote does. A direction is chosen by
+whether the invoice sets `option_blake2b`, because both chains' invoices now
+share a prefix and both nodes read every one. An invoice whose earlier attempt
+ended without paying it can be quoted again, which deletes the cancelled hold
+invoice first, since a node refuses a second invoice for the same hash. And a
+funded swap that cannot be paid within a grace period of its quote's expiry is
+given back rather than paid late. Refusals carry stable codes, and each
+participant can be limited separately. `docs/payer-api.md` is what a wallet
+codes against.
+
 Not built: the payout adapter, which is the **sequenced** binding for a payer
 that issues its own invoice. Nothing has run against mainnet.
 

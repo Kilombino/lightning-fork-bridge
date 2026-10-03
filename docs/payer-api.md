@@ -191,9 +191,13 @@ A payer branches on the code and may show the sentence.
 | `chain_unmeasured` | 400 | The bridge cannot currently measure a chain's block rate, so it cannot size the hold invoice safely. Usually minutes after a restart. |
 | `in_progress` | 409 | A swap for this payment hash is still in progress. |
 | `already_paid` | 409 | A swap for this payment hash settled. `/v2/bridge/swap` has the preimage. |
+| `needs_operator` | 409 | A swap for this payment hash ended in a way only the operator can resolve. |
 | `limit` | 429 | This participant has too many quotes outstanding, or is quoting too fast. |
 | `not_found` | 404 | No swap with that hash. |
 | `internal` | 500 | Anything else. |
+
+A refusal the bridge has no code for comes back as `unavailable`: the bridge
+declined, and the sentence says why.
 
 A credential that is missing, revoked or not allowed this call gets lnd's own
 authentication error, not one of these codes.
@@ -209,6 +213,14 @@ is `already_paid`.
 ## 5. Limits per participant
 
 Each credential is limited on its own, independently of the bridge's overall
-liquidity: how many quotes it may have unpaid at once, how many it may ask for
-per minute, and how much value it may have outstanding. The operator sets them.
-The operator's own administrative macaroon is not limited.
+liquidity:
+
+- how many quotes it may have unpaid at once (an unpaid quote reserves the
+  bridge's liquidity and costs the participant nothing, so this is the limit
+  that matters most);
+- how many swaps it may have unfinished at once, paid or not, which with the
+  per-swap maximum bounds the value it can have outstanding;
+- how many quotes it may ask for in any minute.
+
+Going over any of them is `limit`. The operator sets them. The operator's own
+administrative macaroon is not limited.
