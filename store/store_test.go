@@ -1123,3 +1123,31 @@ func TestCommittedWhereCountsOnlyWhatItIsAsked(t *testing.T) {
 		t.Errorf("unfiltered %d, want 7100", all)
 	}
 }
+
+// TestWhereFindsFinishedSwapsToo: a swap that ended lost is terminal, so
+// Pending never shows it, and it is exactly the one an operator must see. It
+// survives compaction too, which keeps the latest record of every swap.
+func TestWhereFindsFinishedSwapsToo(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "swaps.journal")
+	j := open(t, path)
+
+	for i, st := range []swap.State{swap.Lost, swap.Settled, swap.Funded} {
+		if err := j.Put(ctx, rec(byte(i+1), st)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := j.Compact(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	lost, err := j.Where(ctx, func(r Record) bool {
+		return r.State == swap.Lost
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lost) != 1 || lost[0].Hash != (node.Hash{1}) {
+		t.Errorf("found %v, wanted the one lost swap", lost)
+	}
+}

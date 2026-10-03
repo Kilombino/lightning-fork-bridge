@@ -382,6 +382,41 @@ func (j *Journal) Pending(ctx context.Context) ([]Record, error) {
 	return out, nil
 }
 
+// Where returns every current record keep accepts, finished or not, oldest
+// first. It is for the questions Pending cannot answer, such as which swaps
+// ended in a state only an operator can resolve.
+func (j *Journal) Where(ctx context.Context, keep func(Record) bool) ([]Record,
+	error) {
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	var out []Record
+	for _, r := range j.index {
+		if keep(r) {
+			out = append(out, r)
+		}
+	}
+	sortRecords(out)
+
+	return out, nil
+}
+
+// sortRecords orders records oldest first, by hash where they tie.
+func sortRecords(out []Record) {
+	sort.Slice(out, func(a, b int) bool {
+		if !out[a].Created.Equal(out[b].Created) {
+			return out[a].Created.Before(out[b].Created)
+		}
+
+		return bytes.Compare(out[a].Hash[:], out[b].Hash[:]) < 0
+	})
+}
+
 // Compact rewrites the journal with one record per hash, dropping the history
 // of swaps that have finished.
 //
