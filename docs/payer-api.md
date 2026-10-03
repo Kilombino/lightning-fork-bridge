@@ -151,7 +151,7 @@ bridge's liquidity until it expires, and per-participant limits count it.
   "state": "settled",
   "incoming_msat": "49175859",
   "outgoing_msat": "150000",
-  "preimage": "base64, present once there is one"
+  "preimage": "base64; empty until there is one"
 }
 ```
 
@@ -164,6 +164,10 @@ payer when an attempt has ended so it may try again.
 | `quoted`, `offered` | Quoted, not yet paid. |
 | `funded`, `paying`, `paid`, `failing`, `aborting`, `expiring` | In progress. Wait. |
 | `settled` | Done. The invoice was paid; `preimage` is the proof. |
+
+`preimage` is always present, as an empty string until the swap has one: test
+for an empty value, not for the key. A participant sees only the swaps quoted
+under their own bridge code; any other hash is `not_found`.
 | `failed`, `aborted`, `expired` | Ended without paying the invoice. Any hold-invoice payment came back. The invoice may be quoted again. |
 | `lost` | Ended in a way the operator has to resolve. Not something a payer can act on. |
 
@@ -177,7 +181,7 @@ A payer branches on the code and may show the sentence.
 | Code | HTTP | Meaning |
 | --- | --- | --- |
 | `disabled` | 400 | The bridge is not enabled on this node. |
-| `unavailable` | 503 | Shutting down, or a node it needs did not answer. Try later. |
+| `unavailable` | 503 | Starting, shutting down, or a node it needs did not answer. Try later. |
 | `invalid_request` | 400 | The request is malformed: no invoice, a hash of the wrong length. |
 | `invalid_invoice` | 400 | Neither node can read the invoice. |
 | `no_direction` | 400 | The invoice is for a chain whose direction this bridge does not serve. |
