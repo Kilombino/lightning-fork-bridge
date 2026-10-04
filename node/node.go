@@ -16,6 +16,23 @@ import (
 	"time"
 )
 
+// ErrNotSent says a payment request provably never reached the paying node,
+// so nothing can be in flight because of it.
+//
+// An adapter may return it only when that is certain from how the call
+// failed, not merely likely: the connection could not be made at all, or the
+// node refused the call before any handler ran (it was still starting, or its
+// wallet was locked). A connection lost after the request was written does
+// not qualify, nor does a timeout, since either may follow delivery.
+//
+// The driver reads it as "this attempt never happened" and returns the swap to
+// Funded to be decided again, rather than leaving it in Paying with a node
+// that has no record of the payment, which is ambiguous and needs an operator.
+// Even a wrong reading would not pay twice through a node that still has its
+// records, which refuses a second payment for a hash it is paying or has paid;
+// but adapters must not lean on that.
+var ErrNotSent = errors.New("the payment never reached the paying node")
+
 // ErrUnknownHash is returned when a node has no record of a payment hash.
 var ErrUnknownHash = errors.New("node has no record of this payment hash")
 
@@ -257,6 +274,9 @@ type Outgoing interface {
 	// Pay sends a payment and blocks until it resolves or the request's
 	// timeout elapses. A timeout is not a failure: the payment may still be
 	// in flight, and LookupPayment is the only way to find out.
+	//
+	// An error wrapping ErrNotSent says the request never reached the
+	// node; see there for how certain that has to be.
 	Pay(ctx context.Context, req PayRequest) (Payment, error)
 
 	// LookupPayment reports what a payment is doing. Unlike the incoming

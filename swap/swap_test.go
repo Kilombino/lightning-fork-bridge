@@ -15,6 +15,7 @@ var allEvents = []Event{
 	InvoiceOffered, IncomingAccepted, IncomingLapsed, QuoteExpired,
 	MarginPassed, MarginRefused, OutgoingSucceeded, OutgoingFailed,
 	IncomingSettled, IncomingCancelled, IncomingUnsettleable,
+	OutgoingNotSent,
 }
 
 // TestCannotCancelWhilePaying is the invariant this package exists to hold.
@@ -37,11 +38,13 @@ func TestCannotCancelWhilePaying(t *testing.T) {
 		}
 	}
 
-	// And nothing but a definitive outcome may move Paying at all.
+	// And nothing but a definitive outcome may move Paying at all. Never
+	// having been sent is one: it is certain, and it is the only other
+	// thing the paying node can say for sure about a payment.
 	for _, e := range allEvents {
 		_, _, err := Step(Paying, e)
 		switch e {
-		case OutgoingSucceeded, OutgoingFailed:
+		case OutgoingSucceeded, OutgoingFailed, OutgoingNotSent:
 			if err != nil {
 				t.Errorf("%v must move Paying: %v", e, err)
 			}
@@ -463,6 +466,31 @@ func TestParseStateRoundTripsEveryState(t *testing.T) {
 		if got, err := ParseState(name); !errors.Is(err, ErrUnknownState) {
 			t.Errorf("%q parsed to %v, %v; want ErrUnknownState", name, got,
 				err)
+		}
+	}
+}
+
+// A payment the paying node never received was never in flight: the swap goes
+// back to Funded with nothing to do, so it is decided again, and nothing about
+// that step cancels the incoming claim.
+func TestOutgoingNotSentReturnsToFunded(t *testing.T) {
+	next, action, err := Step(Paying, OutgoingNotSent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != Funded || action != Nothing {
+		t.Fatalf("Paying on not sent went to %v with %v, want Funded "+
+			"with nothing", next, action)
+	}
+
+	// It applies to Paying only: in every other state the claim on the
+	// payment has moved on, and "not sent" cannot be a reason to go back.
+	for _, s := range allStates {
+		if s == Paying {
+			continue
+		}
+		if _, _, err := Step(s, OutgoingNotSent); err == nil {
+			t.Errorf("not sent moved %v", s)
 		}
 	}
 }

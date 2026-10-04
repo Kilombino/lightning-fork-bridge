@@ -359,7 +359,8 @@ func (d *Driver) Do(ctx context.Context, sw *Swap, a swap.Action) error {
 //
 // A timeout or transport error yields no event: the payment may still be in
 // flight, and only LookupPayment can say. The swap stays in Paying, which is
-// precisely the state that forbids cancelling the incoming HTLC.
+// precisely the state that forbids cancelling the incoming HTLC. The one
+// exception is node.ErrNotSent, which yields OutgoingNotSent.
 //
 // Before anything leaves it checks the disk, not memory. A restart reads the
 // disk, so if the disk does not already say this swap might be paying then a
@@ -392,6 +393,12 @@ func (d *Driver) Pay(ctx context.Context, sw *Swap, req node.PayRequest) (
 	}
 
 	pmt, err := d.Out.Pay(ctx, req)
+	if errors.Is(err, node.ErrNotSent) {
+		// Nothing left, so nothing is in flight: the swap goes back to
+		// being funded and is gated again, rather than waiting in
+		// Paying for a node that will have no record of it.
+		return swap.OutgoingNotSent, true, nil
+	}
 	if err != nil {
 		return 0, false, fmt.Errorf("outgoing payment: %w", err)
 	}

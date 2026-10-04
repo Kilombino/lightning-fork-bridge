@@ -178,6 +178,13 @@ const (
 	// because it expired or was resolved by its payer. Raised only after
 	// the outgoing leg has already been paid, where it is a realised loss.
 	IncomingUnsettleable
+
+	// OutgoingNotSent: the outgoing payment provably never reached the
+	// paying node (see node.ErrNotSent), so nothing is in flight and the
+	// swap is funded and undecided again. Appended rather than placed with
+	// the other outgoing events, so that every earlier event keeps its
+	// number.
+	OutgoingNotSent
 )
 
 var eventNames = map[Event]string{
@@ -187,6 +194,7 @@ var eventNames = map[Event]string{
 	OutgoingSucceeded: "outgoing succeeded", OutgoingFailed: "outgoing failed",
 	IncomingSettled: "incoming settled", IncomingCancelled: "incoming cancelled",
 	IncomingUnsettleable: "incoming unsettleable",
+	OutgoingNotSent:      "outgoing not sent",
 }
 
 func (e Event) String() string {
@@ -246,8 +254,9 @@ type outcome struct {
 
 // table is the whole machine. Anything absent from it is refused.
 //
-// Read the Paying row carefully: only a definitive outcome moves it, and only
-// OutgoingFailed produces CancelIncoming.
+// Read the Paying row carefully: only a definitive outcome moves it, only
+// OutgoingFailed produces CancelIncoming, and OutgoingNotSent returns it to
+// Funded with no action.
 var table = map[key]outcome{
 	// Before anything exists on chain.
 	{Quoted, InvoiceOffered}: {Offered, Nothing},
@@ -265,9 +274,14 @@ var table = map[key]outcome{
 	{Funded, MarginRefused}: {Aborting, CancelIncoming},
 	{Funded, QuoteExpired}:  {Aborting, CancelIncoming},
 
-	// In flight. Nothing else may move this.
+	// In flight. Nothing else may move this, with one exception that is
+	// not a decision: a payment the paying node provably never received
+	// was never in flight, so the swap is back where it was before it,
+	// funded, and is gated again (which may refuse it if time has run
+	// short). It never cancels anything by itself.
 	{Paying, OutgoingSucceeded}: {Paid, SettleIncoming},
 	{Paying, OutgoingFailed}:    {Failing, CancelIncoming},
+	{Paying, OutgoingNotSent}:   {Funded, Nothing},
 
 	// Winding up. Each waits for the node to confirm what it was told.
 	{Paid, IncomingSettled}: {Settled, Nothing},

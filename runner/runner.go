@@ -450,9 +450,22 @@ func (r *Runner) pay(ctx context.Context, sw *driver.Swap,
 	if err != nil {
 		return err
 	}
+	if event == swap.OutgoingNotSent {
+		// Funded again. Reported as a transient failure rather than as
+		// progress, so the swap is gated and paid again at the retry
+		// pace and not at once, which against a node that is still down
+		// would spin.
+		return errNotSent
+	}
 
 	return r.carryOut(ctx, sw, action, log)
 }
+
+// errNotSent is why a swap is funded again after an attempt to pay: the paying
+// node did not receive it. Transient, so the swap is retried.
+var errNotSent = errors.New("the paying node did not receive the payment, " +
+	"so nothing was sent; the swap is funded again and will be paid when " +
+	"it answers")
 
 // apply records a transition and reports the action it authorises. The record
 // is durable by the time it returns, which is what makes acting on the action

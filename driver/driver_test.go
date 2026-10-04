@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -671,5 +672,22 @@ func TestDefaultClockIsUsed(t *testing.T) {
 		Rates{Incoming: blake, Outgoing: btc, As: time.Now()})
 	if err != nil || ev != swap.MarginPassed {
 		t.Errorf("%v %v", ev, err)
+	}
+}
+
+// A payment the paying node never received is reported as such, not as an
+// unknown outcome: there is nothing in flight to wait for.
+func TestPayReportsAPaymentThatNeverLeft(t *testing.T) {
+	ctx := context.Background()
+	sw := &Swap{Hash: node.Hash{1}, State: swap.Paying, Created: fixedNow()}
+	out := &fakeOut{payErr: fmt.Errorf("sending: %w", node.ErrNotSent)}
+	d := payingDriver(t, out, sw)
+
+	event, ok, err := d.Pay(ctx, sw, node.PayRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || event != swap.OutgoingNotSent {
+		t.Fatalf("event %v (%v), want %v", event, ok, swap.OutgoingNotSent)
 	}
 }

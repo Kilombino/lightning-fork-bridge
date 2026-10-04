@@ -846,3 +846,110 @@ func TestDrivingSomethingAlreadyFinishedIsANoOp(t *testing.T) {
 		}
 	}
 }
+
+// notSentOut refuses as unreached for its first attempts, then pays: a paying
+// node that was down and came back.
+type notSentOut struct {
+	*fakeOut
+	refusals int32
+}
+
+func (o *notSentOut) Pay(ctx context.Context, req node.PayRequest) (
+	node.Payment, error) {
+
+	if atomic.AddInt32(&o.refusals, -1) >= 0 {
+		atomic.AddInt32(&o.paid, 1)
+
+		return node.Payment{}, fmt.Errorf("sending: %w", node.ErrNotSent)
+	}
+
+	return o.fakeOut.Pay(ctx, req)
+}
+
+// A paying node that never received the payment leaves the swap funded rather
+// than waiting in Paying for a record that will not exist, which needs an
+// operator. When the node answers again the swap is gated and paid as usual,
+// and nothing is cancelled on the way.
+func TestAPaymentTheNodeNeverReceivedIsSentAgain(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &notSentOut{
+		fakeOut: &fakeOut{payment: node.Payment{
+			State: node.PaymentSucceeded, Preimage: preimage,
+		}},
+		refusals: 2,
+	}
+	r, st := build(t, in, out.fakeOut, record(swap.Offered))
+	r.Driver.Out = out
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, err := st.Get(context.Background(), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.State != swap.Settled {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 3 {
+		t.Errorf("tried %d times, want two refusals and one payment", n)
+	}
+	settled, cancelled := in.counts()
+	if settled != 1 || cancelled != 0 {
+		t.Errorf("settled %d, cancelled %d", settled, cancelled)
+	}
+}
+
+// Back in Funded, the margin is decided again: if the node stayed away long
+// enough that paying is no longer safe, the swap is aborted and the payer
+// refunded, rather than paid late.
+func TestANeverReceivedPaymentIsGatedAgain(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &notSentOut{
+		fakeOut: &fakeOut{payment: node.Payment{
+			State: node.PaymentSucceeded, Preimage: preimage,
+		}},
+		refusals: 1,
+	}
+	r, st := build(t, in, out.fakeOut, record(swap.Offered))
+	r.Driver.Out = out
+
+	// While the node is away, the incoming HTLC's deadline closes in: by
+	// the second attempt there is no longer room to pay safely.
+	gated := int32(0)
+	inner := r.Rates
+	r.Rates = func(ctx context.Context) (driver.Rates, error) {
+		if atomic.AddInt32(&gated, 1) > 1 {
+			in.mu.Lock()
+			in.height = 990
+			in.mu.Unlock()
+		}
+
+		return inner(ctx)
+	}
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v, want aborted before paying late", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 1 {
+		t.Errorf("tried %d times, want only the refused one", n)
+	}
+}
