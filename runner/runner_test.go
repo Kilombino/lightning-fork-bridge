@@ -954,3 +954,35 @@ func TestANeverReceivedPaymentIsGatedAgain(t *testing.T) {
 		t.Errorf("tried %d times, want only the refused one", n)
 	}
 }
+
+// After a refusal the runner waits NotSentPause, not a poll tick: a slow poll
+// must not hold up a payment the paying node was only briefly unable to take.
+func TestANeverReceivedPaymentWaitsThePauseNotThePoll(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &notSentOut{
+		fakeOut: &fakeOut{payment: node.Payment{
+			State: node.PaymentSucceeded, Preimage: preimage,
+		}},
+		refusals: 1,
+	}
+	r, st := build(t, in, out.fakeOut, record(swap.Offered))
+	r.Driver.Out = out
+	r.Poll = time.Hour
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+	final, err := st.Get(context.Background(), hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.State != swap.Settled {
+		t.Fatalf("ended in %v", final.State)
+	}
+}
