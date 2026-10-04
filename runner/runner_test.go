@@ -191,7 +191,8 @@ func build(t *testing.T, in *fakeIn, out *fakeOut, rec store.Record) (*Runner,
 	return &Runner{
 		Driver: &driver.Driver{In: in, Out: out, Store: st, Policy: pol,
 			Now: clock},
-		Store: st, Rates: rates, Poll: time.Millisecond, Now: clock,
+		Store: st, Rates: rates, Poll: time.Millisecond,
+		NotSentPause: time.Millisecond, Now: clock,
 	}, st
 }
 

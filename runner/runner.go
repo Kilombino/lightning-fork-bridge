@@ -83,6 +83,10 @@ type Runner struct {
 	// Poll overrides DefaultPoll.
 	Poll time.Duration
 
+	// NotSentPause is how long to wait after the paying node did not
+	// receive a payment before trying again. Zero means DefaultNotSentPause.
+	NotSentPause time.Duration
+
 	// Now is the clock, for tests.
 	Now func() time.Time
 
@@ -115,6 +119,14 @@ func (r *Runner) poll() time.Duration {
 	}
 
 	return DefaultPoll
+}
+
+func (r *Runner) notSentPause() time.Duration {
+	if r.NotSentPause > 0 {
+		return r.NotSentPause
+	}
+
+	return DefaultNotSentPause
 }
 
 func (r *Runner) payTimeout() time.Duration {
@@ -244,12 +256,21 @@ func (r *Runner) Drive(ctx context.Context, hash node.Hash) error {
 			continue
 		}
 
+		// A paying node that is not taking payments is usually being
+		// restarted, which takes seconds to minutes. Asking every tick
+		// would write the swap back and forth through Paying each time
+		// for nothing; a few seconds is nothing against an HTLC's
+		// deadline, and the gate still decides every attempt.
+		wait := ticker.C
+		if errors.Is(err, errNotSent) {
+			wait = time.After(r.notSentPause())
+		}
 		select {
 		case <-ctx.Done():
 			log.Info("interrupted", "state", sw.State.String())
 
 			return ctx.Err()
-		case <-ticker.C:
+		case <-wait:
 		}
 	}
 }
@@ -462,7 +483,12 @@ func (r *Runner) pay(ctx context.Context, sw *driver.Swap,
 }
 
 // errNotSent is why a swap is funded again after an attempt to pay: the paying
-// node did not receive it. Transient, so the swap is retried.
+// node did not receive it. Transient, so the swap is retried, after
+// NotSentPause.
+// DefaultNotSentPause is NotSentPause when none is set: a paying node that is
+// not taking payments is usually restarting, which takes seconds to minutes.
+const DefaultNotSentPause = 5 * time.Second
+
 var errNotSent = errors.New("the paying node did not receive the payment, " +
 	"so nothing was sent; the swap is funded again and will be paid when " +
 	"it answers")
