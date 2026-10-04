@@ -58,6 +58,9 @@ const DefaultPoll = time.Second
 // was sized against a block rate the chain may since have left.
 type Rates func(context.Context) (driver.Rates, error)
 
+// PriceCheck decides whether a funded swap is still worth paying.
+type PriceCheck func(context.Context, *driver.Swap) (bool, error)
+
 // Runner drives swaps.
 type Runner struct {
 	Driver *driver.Driver
@@ -65,6 +68,18 @@ type Runner struct {
 
 	// Rates measures both chains. Required.
 	Rates Rates
+
+	// PriceCheck, when set, decides just before paying whether the swap is
+	// still worth paying at the price now: false when what the payer sent
+	// no longer covers the payout and its routing budget. A false gives the
+	// payer's funds back, as a refused margin does; an error means the
+	// price cannot be read, which waits, like a chain that cannot be
+	// measured, and past the funded grace the swap is given back.
+	//
+	// The quote fixed what the payer owes, and a payer may fund it minutes
+	// later. On a market that moves a few percent in that time the bridge
+	// would otherwise pay out at a loss whenever the move went against it.
+	PriceCheck PriceCheck
 
 	// PayTimeout bounds one outgoing attempt. Zero means two minutes.
 	PayTimeout time.Duration
@@ -412,6 +427,25 @@ func (r *Runner) gate(ctx context.Context, sw *driver.Swap,
 		// cancel: the HTLC is still claimable and the margin may well hold
 		// once the measurement comes back.
 		return false, fmt.Errorf("measuring block spacing: %w", err)
+	}
+
+	if r.PriceCheck != nil {
+		ok, err := r.PriceCheck(ctx, sw)
+		if err != nil {
+			// Waiting, not refusing: a price source that failed to
+			// answer says nothing about this swap, and the funded
+			// grace gives it back if the answer never comes.
+			return false, fmt.Errorf("checking the price: %w", err)
+		}
+		if !ok {
+			log.Info("gated", "decision", "price refused")
+			action, err := r.apply(ctx, sw, swap.MarginRefused, log)
+			if err != nil {
+				return false, err
+			}
+
+			return true, r.carryOut(ctx, sw, action, log)
+		}
 	}
 
 	event, err := r.Driver.Gate(ctx, sw, rates)

@@ -986,3 +986,112 @@ func TestANeverReceivedPaymentWaitsThePauseNotThePoll(t *testing.T) {
 		t.Fatalf("ended in %v", final.State)
 	}
 }
+
+// TestAPriceThatNoLongerCoversThePayoutGivesTheFundsBack: the quote was
+// funded, but at the price now what the payer sent is worth less than what
+// the bridge would pay out. Nothing is paid; the payer's HTLC is cancelled.
+func TestAPriceThatNoLongerCoversThePayoutGivesTheFundsBack(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}
+	r, st := build(t, in, out, record(swap.Funded))
+	var asked int32
+	r.PriceCheck = func(_ context.Context, sw *driver.Swap) (bool, error) {
+		atomic.AddInt32(&asked, 1)
+		if sw.Hash != hash {
+			t.Errorf("asked about %x", sw.Hash)
+		}
+
+		return false, nil
+	}
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Aborted {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Errorf("paid %d times at a loss", n)
+	}
+	if _, cancelled := in.counts(); cancelled != 1 {
+		t.Errorf("cancelled %d times", cancelled)
+	}
+	if atomic.LoadInt32(&asked) == 0 {
+		t.Error("the price was never checked")
+	}
+}
+
+// TestAPriceThatCannotBeReadDecidesNothing: a price source that does not
+// answer is a reason to wait, not to pay and not to cancel.
+func TestAPriceThatCannotBeReadDecidesNothing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(),
+		200*time.Millisecond)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}
+	r, st := build(t, in, out, record(swap.Funded))
+	r.PriceCheck = func(context.Context, *driver.Swap) (bool, error) {
+		return false, errors.New("the market could not be read")
+	}
+
+	if err := r.Drive(ctx, hash); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("want the context to be what stopped it, got %v", err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Funded {
+		t.Errorf("it moved to %v without a price", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 0 {
+		t.Error("it paid without a price")
+	}
+	if _, cancelled := in.counts(); cancelled != 0 {
+		t.Error("it cancelled without a price")
+	}
+}
+
+// TestAPriceThatStillCoversThePayoutPays.
+func TestAPriceThatStillCoversThePayoutPays(t *testing.T) {
+	ctx, cancel := deadline(t)
+	defer cancel()
+
+	in := &fakeIn{
+		invoice: node.Invoice{State: node.InvoiceAccepted, ExpiryHeight: 1000},
+		height:  500,
+	}
+	out := &fakeOut{payment: node.Payment{
+		State: node.PaymentSucceeded, Preimage: preimage,
+	}}
+	r, st := build(t, in, out, record(swap.Funded))
+	r.PriceCheck = func(context.Context, *driver.Swap) (bool, error) {
+		return true, nil
+	}
+
+	if err := r.Drive(ctx, hash); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := st.Get(context.Background(), hash)
+	if final.State != swap.Settled {
+		t.Fatalf("ended in %v", final.State)
+	}
+	if n := atomic.LoadInt32(&out.paid); n != 1 {
+		t.Errorf("paid %d times", n)
+	}
+}
