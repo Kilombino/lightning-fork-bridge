@@ -482,13 +482,13 @@ func (r *Runner) pay(ctx context.Context, sw *driver.Swap,
 	return r.carryOut(ctx, sw, action, log)
 }
 
-// errNotSent is why a swap is funded again after an attempt to pay: the paying
-// node did not receive it. Transient, so the swap is retried, after
-// NotSentPause.
 // DefaultNotSentPause is NotSentPause when none is set: a paying node that is
 // not taking payments is usually restarting, which takes seconds to minutes.
 const DefaultNotSentPause = 5 * time.Second
 
+// errNotSent is why a swap is funded again after an attempt to pay: the paying
+// node did not receive it. Transient, so the swap is retried, after
+// NotSentPause.
 var errNotSent = errors.New("the paying node did not receive the payment, " +
 	"so nothing was sent; the swap is funded again and will be paid when " +
 	"it answers")
