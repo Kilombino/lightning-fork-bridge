@@ -463,20 +463,53 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	}
 	terms.Outgoing = invoice
 
+	spacing, err := q.Spacing(ctx)
+	if err != nil {
+		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	if spacing.As.IsZero() {
+		return Quote{}, fmt.Errorf("%w: block spacing carries no measurement "+
+			"time", ErrRefused)
+	}
+
+	// The route budget the chains allow now: the policy's, or less when the
+	// incoming chain runs fast or the outgoing one slow. Asking for a route
+	// within the policy's alone would find one that then cannot be quoted.
+	budget, err := margin.MaxOutgoingBlocks(spacing.Incoming,
+		spacing.Outgoing, q.Margin)
+	if err != nil {
+		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
+	}
+	if budget > q.Policy.OutgoingCLTVLimit {
+		budget = q.Policy.OutgoingCLTVLimit
+	}
+	if budget == 0 {
+		// Not even one block of route fits: the chains' pace, not this
+		// invoice, refuses it, and that passes.
+		return Quote{}, fmt.Errorf("%w: %w: the chains allow no route "+
+			"budget now", ErrRefused, margin.ErrTooLong)
+	}
+	if budget <= dec.CLTVDelta {
+		return Quote{}, fmt.Errorf("%w: %w: the destination wants %d "+
+			"blocks on the final hop and the chains allow %d for the "+
+			"whole route now", ErrRefused, ErrRouteBudget,
+			dec.CLTVDelta, budget)
+	}
+
 	// A route to the destination within the budgets, asked of the paying
 	// node before anything is created: a payer is otherwise held, briefly,
 	// for a payment the bridge then finds it cannot make. The swap's CLTV
 	// limit is the route's with slack, so a short route asks a short hold
 	// of the payer rather than the whole budget.
-	terms.OutgoingCLTVLimit = q.Policy.OutgoingCLTVLimit
+	terms.OutgoingCLTVLimit = budget
 	if finder, ok := q.Out.(node.RouteFinder); ok {
 		route, err := finder.FindRoute(ctx, invoice, terms.MaxFeeMsat,
-			q.Policy.OutgoingCLTVLimit)
+			budget)
 		switch {
 		case errors.Is(err, node.ErrNoRoute):
 			return Quote{}, fmt.Errorf("%w: %w: within %d msat of fees "+
 				"and %d blocks", ErrRefused, ErrNoRoute,
-				terms.MaxFeeMsat, q.Policy.OutgoingCLTVLimit)
+				terms.MaxFeeMsat, budget)
 
 		case err != nil:
 			return Quote{}, fmt.Errorf("%w: finding a route: %w",
@@ -489,14 +522,6 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 		}
 	}
 
-	spacing, err := q.Spacing(ctx)
-	if err != nil {
-		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
-	}
-	if spacing.As.IsZero() {
-		return Quote{}, fmt.Errorf("%w: block spacing carries no measurement "+
-			"time", ErrRefused)
-	}
 	blocks, err := margin.RequiredIncomingBlocks(spacing.Incoming, margin.Leg{
 		Bounds: spacing.Outgoing,
 		Blocks: terms.OutgoingCLTVLimit,

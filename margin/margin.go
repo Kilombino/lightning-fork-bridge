@@ -217,3 +217,39 @@ func Check(in, out Leg, p Policy) error {
 
 	return nil
 }
+
+// MaxOutgoingBlocks is the most CLTV the outgoing leg may use, in blocks of
+// its chain, for the incoming leg to outlive it within the policy's
+// MaxIncomingBlocks: the route budget the chains allow right now. Zero when
+// not even one block fits.
+//
+// It moves with the measured spacing. A configured budget is a ceiling; when
+// the incoming chain runs fast or the outgoing one slow, fewer blocks fit, and
+// asking for a route within this rather than the ceiling finds one that can
+// actually be quoted, if there is one.
+func MaxOutgoingBlocks(in, out Bounds, p Policy) (uint32, error) {
+	if !in.Valid() || !out.Valid() {
+		return 0, fmt.Errorf("%w: incoming %+v, outgoing %+v", ErrBounds,
+			in, out)
+	}
+	fits := func(n uint32) bool {
+		_, err := RequiredIncomingBlocks(in, Leg{Bounds: out, Blocks: n}, p)
+		return err == nil
+	}
+	if !fits(0) {
+		return 0, nil
+	}
+	// RequiredIncomingBlocks grows with n, so the largest that fits is
+	// found by bisection.
+	lo, hi := uint32(0), uint32(MaxBlocks)
+	for lo < hi {
+		mid := lo + (hi-lo+1)/2
+		if fits(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+
+	return lo, nil
+}

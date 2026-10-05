@@ -429,3 +429,39 @@ func TestSettlementAdditionCannotWrap(t *testing.T) {
 		t.Fatal("Check accepted a swap whose exposure overflows")
 	}
 }
+
+// TestMaxOutgoingBlocksIsTheLargestThatFits pins it against
+// RequiredIncomingBlocks, and shows it shrinking when the incoming chain runs
+// faster.
+func TestMaxOutgoingBlocksIsTheLargestThatFits(t *testing.T) {
+	p := Policy{Settlement: time.Hour, MaxIncomingBlocks: 1776}
+	in := Bounds{Fast: 200 * time.Second, Slow: 40 * time.Minute}
+	out := Bounds{Fast: 5 * time.Minute, Slow: 15 * time.Minute}
+
+	n, err := MaxOutgoingBlocks(in, out, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 390 {
+		t.Errorf("at target spacing %d blocks fit, want 390", n)
+	}
+	if _, err := RequiredIncomingBlocks(in, Leg{Bounds: out, Blocks: n}, p); err != nil {
+		t.Errorf("%d does not fit: %v", n, err)
+	}
+	if _, err := RequiredIncomingBlocks(in, Leg{Bounds: out, Blocks: n + 1}, p); err == nil {
+		t.Errorf("%d fits too", n+1)
+	}
+
+	// The incoming chain running 1.3x faster: fewer fit.
+	fast := Bounds{Fast: in.Fast * 10 / 13, Slow: in.Slow}
+	m, _ := MaxOutgoingBlocks(fast, out, p)
+	if m >= n || m < 290 {
+		t.Errorf("with the incoming chain faster %d fit, want fewer than %d", m, n)
+	}
+
+	// Nothing fits when the settlement alone does not.
+	tight := Policy{Settlement: 1000 * time.Hour, MaxIncomingBlocks: 10}
+	if m, _ := MaxOutgoingBlocks(in, out, tight); m != 0 {
+		t.Errorf("%d fit under an impossible policy", m)
+	}
+}

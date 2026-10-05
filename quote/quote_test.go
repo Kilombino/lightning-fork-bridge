@@ -916,3 +916,22 @@ func TestASmallPayoutGetsTheFeeFloor(t *testing.T) {
 		t.Errorf("routing budget %d msat", got.MaxFeeMsat)
 	}
 }
+
+// TestTheRouteIsSoughtWithinWhatTheChainsAllowNow: a ceiling larger than the
+// measured spacing can carry is not what the route is sought within.
+func TestTheRouteIsSoughtWithinWhatTheChainsAllowNow(t *testing.T) {
+	ctx := context.Background()
+	out := &routedOut{fakeOut: fakeOut{decoded: decoded()},
+		route: node.Route{CLTV: 60}}
+	q, _ := buildRouted(t, &fakeIn{}, out, 0.015)
+	q.Policy.OutgoingCLTVLimit = 100_000
+
+	if _, err := q.Quote(ctx, "lnbc1originalinvoice"); err != nil {
+		t.Fatal(err)
+	}
+	allowed, _ := margin.MaxOutgoingBlocks(blake, btc, marg)
+	if out.cltv != allowed || allowed >= 100_000 || allowed == 0 {
+		t.Errorf("sought within %d blocks, the chains allow %d", out.cltv,
+			allowed)
+	}
+}
