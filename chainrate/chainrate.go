@@ -95,11 +95,18 @@ var BlakeParams = Params{
 
 // BitcoinParams is the same shape for the SHA256 chain, which sits close to
 // its target and varies far less, so the factors are tighter.
+//
+// The stall factor is measured: the slowest stretch in the chain's history,
+// the 2021 mining ban (heights 688824-689208, about four days), ran 1.38x the
+// spacing the observer would have measured when it began (1.26x the target,
+// running 1.75x). 1.5 covers it. It is that low only because the slow bound
+// takes the slower of the current and previous epochs (SlowSpacing); taken
+// from the faster, as it once was, 2 was needed.
 var BitcoinParams = Params{
 	RetargetInterval: 2016,
 	TargetSpacing:    10 * time.Minute,
 	SurgeFactor:      2,
-	StallFactor:      2,
+	StallFactor:      1.5,
 	MinSamples:       100,
 	SurgeWindow:      144,
 }
@@ -207,10 +214,17 @@ type Estimate struct {
 	// Bounds is what margin consumes.
 	Bounds margin.Bounds
 
-	// Spacing is the mean seconds per block the bounds derive from: the
-	// current epoch's own mean, or the more conservative of that and the
-	// previous epoch's mean scaled by the difficulty change.
+	// Spacing is the mean seconds per block the fast bound derives from:
+	// the current epoch's own mean, or the shorter of that and the previous
+	// epoch's mean scaled by the difficulty change.
 	Spacing time.Duration
+
+	// SlowSpacing is the one the slow bound derives from: the longer of the
+	// two. Each bound takes the more cautious estimate for its own side. A
+	// chain that has slowed this epoch reads near its target from the
+	// previous one, scaled; the slow bound taken from that read SHA256's
+	// 2021 slowdown (blocks 1.75x the target over four days) as 1.0x.
+	SlowSpacing time.Duration
 
 	// Epoch is the retarget epoch the tip is in.
 	Epoch int32
@@ -291,6 +305,16 @@ func (o *Observer) Estimate(now time.Time) (Estimate, error) {
 		}
 	}
 
+	// The slow bound's spacing: the longer of the two, where both exist.
+	slow := currentMean
+	switch {
+	case currentErr != nil && haveScaled:
+		slow = scaled
+	case currentErr == nil && haveScaled && scaled > currentMean:
+		slow = scaled
+	}
+	est.SlowSpacing = slow
+
 	switch {
 	case currentErr == nil && len(current) >= o.params.MinSamples:
 		// Enough of the current epoch to stand on its own. Still take the
@@ -332,9 +356,12 @@ func (o *Observer) Estimate(now time.Time) (Estimate, error) {
 		return est, fmt.Errorf("%w: spacing %v", ErrIncoherent, est.Spacing)
 	}
 
+	if est.SlowSpacing < est.Spacing {
+		est.SlowSpacing = est.Spacing
+	}
 	est.Bounds = margin.Bounds{
 		Fast: time.Duration(float64(est.Spacing) / o.params.SurgeFactor),
-		Slow: time.Duration(float64(est.Spacing) * o.params.StallFactor),
+		Slow: time.Duration(float64(est.SlowSpacing) * o.params.StallFactor),
 	}
 	if est.Bounds.Fast <= 0 {
 		return est, fmt.Errorf("%w: fast bound %v", ErrIncoherent,

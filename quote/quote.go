@@ -69,6 +69,12 @@ type Policy struct {
 	// of its amount.
 	FeeFraction float64
 
+	// MinFeeMsat is the least routing budget, whatever the fraction gives:
+	// a small payout's fraction is less than one hop's base fee, so it
+	// could not be routed at all. A payout whose spread does not cover
+	// this is refused as too small.
+	MinFeeMsat uint64
+
 	// MinRemainingLife is how long the outgoing invoice must still be payable
 	// for. A quote on an invoice about to expire sells something the bridge
 	// may not be able to deliver.
@@ -85,6 +91,7 @@ var DefaultPolicy = Policy{
 	InvoiceExpiry:     10 * time.Minute,
 	OutgoingCLTVLimit: 80,
 	FeeFraction:       0.003,
+	MinFeeMsat:        10_000, // 10 sats
 	MinRemainingLife:  15 * time.Minute,
 }
 
@@ -137,6 +144,11 @@ type Quote struct {
 	// MaxFeeMsat is the routing budget, which comes out of the spread.
 	MaxFeeMsat uint64
 
+	// OutgoingCLTVLimit is the CLTV the outgoing route may use, in blocks of
+	// the outgoing chain: the route the paying node found, with RouteSlack,
+	// or the policy's whole budget when it cannot be asked.
+	OutgoingCLTVLimit uint32
+
 	// CLTVDelta is what the payer must leave on the final hop, in blocks of
 	// the incoming chain.
 	CLTVDelta uint32
@@ -147,6 +159,12 @@ type Quote struct {
 	// Description is the outgoing invoice's own, shown back to the payer.
 	Description string
 }
+
+// RouteSlack is added to the CLTV of the route a paying node found, for the
+// swap's limit: a route that changes a little between the quote and the
+// payment still fits. Payment along a longer one fails, and the payer's funds
+// come back.
+const RouteSlack = 40
 
 // Pricer supplies the rate to quote at, or a refusal.
 type Pricer func(ctx context.Context) (rate.Reading, error)
@@ -445,6 +463,32 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	}
 	terms.Outgoing = invoice
 
+	// A route to the destination within the budgets, asked of the paying
+	// node before anything is created: a payer is otherwise held, briefly,
+	// for a payment the bridge then finds it cannot make. The swap's CLTV
+	// limit is the route's with slack, so a short route asks a short hold
+	// of the payer rather than the whole budget.
+	terms.OutgoingCLTVLimit = q.Policy.OutgoingCLTVLimit
+	if finder, ok := q.Out.(node.RouteFinder); ok {
+		route, err := finder.FindRoute(ctx, invoice, terms.MaxFeeMsat,
+			q.Policy.OutgoingCLTVLimit)
+		switch {
+		case errors.Is(err, node.ErrNoRoute):
+			return Quote{}, fmt.Errorf("%w: %w: within %d msat of fees "+
+				"and %d blocks", ErrRefused, ErrNoRoute,
+				terms.MaxFeeMsat, q.Policy.OutgoingCLTVLimit)
+
+		case err != nil:
+			return Quote{}, fmt.Errorf("%w: finding a route: %w",
+				ErrRefused, err)
+		}
+		if limit := route.CLTV + RouteSlack; route.CLTV > 0 &&
+			limit < terms.OutgoingCLTVLimit {
+
+			terms.OutgoingCLTVLimit = limit
+		}
+	}
+
 	spacing, err := q.Spacing(ctx)
 	if err != nil {
 		return Quote{}, fmt.Errorf("%w: %w", ErrRefused, err)
@@ -455,7 +499,7 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 	}
 	blocks, err := margin.RequiredIncomingBlocks(spacing.Incoming, margin.Leg{
 		Bounds: spacing.Outgoing,
-		Blocks: q.Policy.OutgoingCLTVLimit,
+		Blocks: terms.OutgoingCLTVLimit,
 	}, q.Margin)
 	if err != nil {
 		return Quote{}, fmt.Errorf("%w: sizing the incoming CLTV: %w",
@@ -642,6 +686,16 @@ func (q *Quoter) price(dec node.Decoded, r rate.Reading) (Quote, error) {
 	}
 
 	fee := uint64(math.Ceil(float64(dec.AmountMsat) * q.Policy.FeeFraction))
+	if fee < q.Policy.MinFeeMsat {
+		fee = q.Policy.MinFeeMsat
+	}
+	// The floor, unlike the fraction, can outgrow the spread on a small
+	// payout, and then every such swap loses money by construction.
+	if float64(fee) >= float64(dec.AmountMsat)*r.Spread {
+		return Quote{}, fmt.Errorf("%w: %w: %d msat cannot cover the "+
+			"%d msat routing budget out of a %.2f%% spread", ErrRefused,
+			ErrTooSmall, dec.AmountMsat, fee, r.Spread*100)
+	}
 
 	return Quote{
 		Hash:         dec.Hash,
@@ -669,7 +723,7 @@ func (q *Quoter) create(ctx context.Context, terms *Quote, who string,
 	rec := store.Record{
 		Hash:              terms.Hash,
 		State:             swap.Quoted,
-		OutgoingCLTVLimit: q.Policy.OutgoingCLTVLimit,
+		OutgoingCLTVLimit: terms.OutgoingCLTVLimit,
 		Invoice:           terms.Outgoing,
 		IncomingMsat:      terms.IncomingMsat,
 		OutgoingMsat:      terms.OutgoingMsat,

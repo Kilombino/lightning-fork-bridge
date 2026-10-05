@@ -772,3 +772,147 @@ func TestTheBridgeCannotOversellItsBalance(t *testing.T) {
 		t.Errorf("room was not released when a swap finished: %v", err)
 	}
 }
+
+// routedOut is a paying node that can be asked for a route.
+type routedOut struct {
+	fakeOut
+	route  node.Route
+	err    error
+	maxFee uint64
+	cltv   uint32
+	asked  int
+}
+
+func (r *routedOut) FindRoute(_ context.Context, _ string, maxFeeMsat uint64,
+	cltvLimit uint32) (node.Route, error) {
+
+	r.asked++
+	r.maxFee, r.cltv = maxFeeMsat, cltvLimit
+
+	return r.route, r.err
+}
+
+func buildRouted(t *testing.T, in *fakeIn, out *routedOut,
+	spread float64) (*Quoter, *store.Memory) {
+
+	t.Helper()
+	q, st := build(t, in, &out.fakeOut, spread)
+	q.Out = out
+
+	return q, st
+}
+
+// TestNoRouteIsRefusedBeforeAnythingIsCreated: the payer is never held for a
+// payment the bridge cannot make.
+func TestNoRouteIsRefusedBeforeAnythingIsCreated(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{}
+	out := &routedOut{fakeOut: fakeOut{decoded: decoded()}, err: node.ErrNoRoute}
+	q, st := buildRouted(t, in, out, 0.015)
+
+	_, err := q.Quote(ctx, "lnbc1originalinvoice")
+	if !errors.Is(err, ErrNoRoute) || CodeOf(err) != CodeNoRoute {
+		t.Fatalf("want no_route, got %v (%s)", err, CodeOf(err))
+	}
+	if in.asked != nil {
+		t.Error("a hold invoice was created for a payment that cannot be made")
+	}
+	if _, err := st.Get(ctx, hash); err == nil {
+		t.Error("a swap was recorded")
+	}
+	if out.cltv != DefaultPolicy.OutgoingCLTVLimit {
+		t.Errorf("asked for routes within %d blocks", out.cltv)
+	}
+	if out.maxFee != 300_000 {
+		t.Errorf("asked for routes within %d msat of fees", out.maxFee)
+	}
+
+	// A node that cannot be asked is a refusal too, not a guess.
+	out.err = errors.New("connection refused")
+	if _, err := q.Quote(ctx, "lnbc1originalinvoice"); !errors.Is(err,
+		ErrRefused) {
+
+		t.Fatalf("want a refusal, got %v", err)
+	}
+}
+
+// TestTheSwapIsSizedToTheRouteFound: a short route asks a short hold of the
+// payer; the payment and the gate are held to that route's limit.
+func TestTheSwapIsSizedToTheRouteFound(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{}
+	out := &routedOut{fakeOut: fakeOut{decoded: decoded()},
+		route: node.Route{CLTV: 20, FeeMsat: 1000}}
+	q, st := buildRouted(t, in, out, 0.015)
+	q.Policy.OutgoingCLTVLimit = 300
+
+	got, err := q.Quote(ctx, "lnbc1originalinvoice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OutgoingCLTVLimit != 20+RouteSlack {
+		t.Errorf("limit %d, want the route's 20 plus %d", got.OutgoingCLTVLimit,
+			RouteSlack)
+	}
+	rec, err := st.Get(ctx, hash)
+	if err != nil || rec.OutgoingCLTVLimit != got.OutgoingCLTVLimit {
+		t.Fatalf("recorded %d (%v)", rec.OutgoingCLTVLimit, err)
+	}
+	short := got.CLTVDelta
+
+	// The whole budget when the node cannot narrow it.
+	in2 := &fakeIn{}
+	q2, _ := build(t, in2, &fakeOut{decoded: decoded()}, 0.015)
+	q2.Policy.OutgoingCLTVLimit = 300
+	full, err := q2.Quote(ctx, "lnbc1originalinvoice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full.OutgoingCLTVLimit != 300 || short >= full.CLTVDelta {
+		t.Errorf("routed asks %d incoming blocks, unrouted %d (limit %d)",
+			short, full.CLTVDelta, full.OutgoingCLTVLimit)
+	}
+
+	// A route near the budget keeps the budget, not more.
+	in3 := &fakeIn{}
+	out3 := &routedOut{fakeOut: fakeOut{decoded: decoded()},
+		route: node.Route{CLTV: 290}}
+	q3, _ := buildRouted(t, in3, out3, 0.015)
+	q3.Policy.OutgoingCLTVLimit = 300
+	if got, _ := q3.Quote(ctx, "lnbc1originalinvoice"); got.OutgoingCLTVLimit != 300 {
+		t.Errorf("limit %d, want the budget", got.OutgoingCLTVLimit)
+	}
+}
+
+// TestASmallPayoutGetsTheFeeFloor: the fraction of a small payout is less than
+// one hop's base fee.
+func TestASmallPayoutGetsTheFeeFloor(t *testing.T) {
+	ctx := context.Background()
+	in := &fakeIn{}
+	small := decoded()
+	small.AmountMsat = 1_000_000 // 1,000 sats: 0.3% is 3 sats
+	q, _ := build(t, in, &fakeOut{decoded: small}, 0.015)
+
+	got, err := q.Quote(ctx, "lnbc1originalinvoice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxFeeMsat != 10_000 {
+		t.Errorf("routing budget %d msat, want the 10-sat floor", got.MaxFeeMsat)
+	}
+
+	// Below what the spread can pay the floor out of: refused as too small.
+	tiny := decoded()
+	tiny.AmountMsat = 500_000
+	q2, _ := build(t, &fakeIn{}, &fakeOut{decoded: tiny}, 0.015)
+	q2.Policy.MinSwapMsat = 1000
+	if _, err := q2.Quote(ctx, "lnbc1originalinvoice"); CodeOf(err) != CodeTooSmall {
+		t.Fatalf("want too_small, got %v", err)
+	}
+
+	// A large payout keeps its fraction.
+	q3, _ := build(t, &fakeIn{}, &fakeOut{decoded: decoded()}, 0.015)
+	if got, _ := q3.Quote(ctx, "lnbc1originalinvoice"); got.MaxFeeMsat != 300_000 {
+		t.Errorf("routing budget %d msat", got.MaxFeeMsat)
+	}
+}

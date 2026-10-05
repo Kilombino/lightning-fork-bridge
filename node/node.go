@@ -36,6 +36,26 @@ var ErrNotSent = errors.New("the payment never reached the paying node")
 // ErrUnknownHash is returned when a node has no record of a payment hash.
 var ErrUnknownHash = errors.New("node has no record of this payment hash")
 
+// ErrNoRoute is returned by a RouteFinder that has no route to an invoice's
+// destination within the limits asked for.
+var ErrNoRoute = errors.New("no route to the destination within the limits")
+
+// Route is a route a RouteFinder found: the CLTV it would lock the payment
+// for, counted in blocks from now, and what it would pay in routing fees.
+type Route struct {
+	CLTV    uint32
+	FeeMsat uint64
+}
+
+// RouteFinder is an Outgoing node that can say, before anything is committed,
+// whether it has a route to an invoice's destination within a routing budget
+// and a CLTV limit. Optional: a quote asks one when the paying node is one,
+// and otherwise sizes the swap to the whole budget as before.
+type RouteFinder interface {
+	FindRoute(ctx context.Context, invoice string, maxFeeMsat uint64,
+		cltvLimit uint32) (Route, error)
+}
+
 // Hash is a payment hash. The same one appears on both chains, which is what
 // makes a swap atomic.
 type Hash [32]byte

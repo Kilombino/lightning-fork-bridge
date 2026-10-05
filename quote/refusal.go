@@ -39,6 +39,12 @@ var (
 	// route.
 	ErrRouteBudget = errors.New("the destination's CLTV fills the budget")
 
+	// ErrNoRoute: the paying node has no route to the invoice's destination
+	// within the bridge's routing budget and CLTV limit. Asked before the
+	// quote, so a payer is not held for a payment that cannot be made.
+	ErrNoRoute = errors.New("no route to the destination within the " +
+		"bridge's limits")
+
 	// ErrSelfPayment: the invoice pays one of the bridge's own nodes.
 	ErrSelfPayment = errors.New("the invoice pays the bridge itself")
 
@@ -83,6 +89,7 @@ const (
 	CodeTooLarge         Code = "too_large"
 	CodeExpiresSoon      Code = "expires_soon"
 	CodeRouteBudget      Code = "route_budget"
+	CodeNoRoute          Code = "no_route"
 	CodeSelfPayment      Code = "self_payment"
 	CodeNoLiquidity      Code = "no_liquidity"
 	CodePriceUnavailable Code = "price_unavailable"
@@ -120,6 +127,8 @@ func CodeOf(err error) Code {
 		return CodeExpiresSoon
 	case errors.Is(err, ErrRouteBudget):
 		return CodeRouteBudget
+	case errors.Is(err, ErrNoRoute):
+		return CodeNoRoute
 	case errors.Is(err, ErrSelfPayment):
 		return CodeSelfPayment
 	case errors.Is(err, ErrLimit):

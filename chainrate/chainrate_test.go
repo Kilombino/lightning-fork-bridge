@@ -465,3 +465,38 @@ func TestUpwardRetargetDoesNotFakeASurge(t *testing.T) {
 		t.Errorf("a genuine surge must still be caught, got %v", err)
 	}
 }
+
+// TestTheSlowBoundTakesTheSlowerEstimate: a chain that has slowed this epoch,
+// as SHA256 did in 2021, is read at its slower current rate for the slow
+// bound, not at the target the scaled previous epoch implies; the fast bound
+// still takes the faster.
+func TestTheSlowBoundTakesTheSlowerEstimate(t *testing.T) {
+	p := BitcoinParams
+	p.SurgeWindow = 0
+	o, err := New(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1_700_000_000, 0)
+
+	// Previous epoch at the target; this one, same difficulty, at 1.26x.
+	prev := steady(2016, 2016, base, 600*time.Second, 1e12)
+	feed(t, o, prev)
+	cur := steady(4032, 1500, last(prev), 756*time.Second, 1e12)
+	feed(t, o, cur)
+
+	est, err := o.Estimate(last(cur))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if est.Spacing != 600*time.Second {
+		t.Errorf("fast side's spacing %v, want the faster 600s", est.Spacing)
+	}
+	if est.SlowSpacing != 756*time.Second {
+		t.Errorf("slow side's spacing %v, want the slower 756s", est.SlowSpacing)
+	}
+	// 756s x 1.5: above the 1.75x (1050s) the worst four days actually ran.
+	if est.Bounds.Slow < 1050*time.Second {
+		t.Errorf("slow bound %v would not have covered 2021", est.Bounds.Slow)
+	}
+}
