@@ -490,9 +490,13 @@ func (q *Quoter) QuoteFor(ctx context.Context, who, invoice string) (Quote,
 			"budget now", ErrRefused, margin.ErrTooLong)
 	}
 	if budget <= dec.CLTVDelta {
+		// checkInvoice already refused an invoice whose final hop fills
+		// the policy's budget, so this is the chains' pace shrinking it:
+		// it passes, and is said as such rather than as a fault of the
+		// invoice.
 		return Quote{}, fmt.Errorf("%w: %w: the destination wants %d "+
 			"blocks on the final hop and the chains allow %d for the "+
-			"whole route now", ErrRefused, ErrRouteBudget,
+			"whole route now", ErrRefused, margin.ErrTooLong,
 			dec.CLTVDelta, budget)
 	}
 

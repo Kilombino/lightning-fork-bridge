@@ -935,3 +935,21 @@ func TestTheRouteIsSoughtWithinWhatTheChainsAllowNow(t *testing.T) {
 			allowed)
 	}
 }
+
+// TestARouteBudgetShrunkByThePaceIsRetryable: when the chains' pace leaves
+// less route budget than the destination's final hop, the refusal is the
+// chains' (retryable), not the invoice's.
+func TestARouteBudgetShrunkByThePaceIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	long := decoded()
+	q, _ := build(t, &fakeIn{}, &fakeOut{decoded: long}, 0.015)
+	allowed, _ := margin.MaxOutgoingBlocks(blake, btc, marg)
+	long.CLTVDelta = allowed
+	q.Out = &fakeOut{decoded: long}
+	q.Policy.OutgoingCLTVLimit = allowed + 100
+
+	_, err := q.Quote(ctx, "lnbc1originalinvoice")
+	if CodeOf(err) != CodeChainUnmeasured {
+		t.Fatalf("want chain_unmeasured, got %s (%v)", CodeOf(err), err)
+	}
+}
