@@ -87,7 +87,19 @@ type Policy struct {
 	// swap needing more is refused rather than quoted, since a CLTV nobody
 	// will route is worse than no quote.
 	MaxIncomingBlocks uint32
+
+	// HoldExpiryDelta is how many blocks before the incoming HTLC expires
+	// the incoming node gives up on the held invoice: lnd cancels an
+	// accepted hold invoice invoices.holdexpirydelta blocks early, 18 by
+	// default. From then on the claim is gone though the HTLC has not
+	// expired, so those blocks are no margin at all: the quote asks the
+	// payer for them on top, and the gate does not count them.
+	HoldExpiryDelta uint32
 }
+
+// DefaultHoldExpiryDelta is lnd's default invoices.holdexpirydelta: its
+// incoming broadcast delta, 16 blocks since lnd 0.21, plus 2.
+const DefaultHoldExpiryDelta = 18
 
 // DefaultPolicy is a starting point, not a recommendation for any particular
 // operator. One hour of settlement covers a claim confirming on a chain
@@ -96,12 +108,25 @@ type Policy struct {
 var DefaultPolicy = Policy{
 	Settlement:        time.Hour,
 	MaxIncomingBlocks: 2016,
+	HoldExpiryDelta:   DefaultHoldExpiryDelta,
 }
 
 // Valid reports whether the policy is usable.
 func (p Policy) Valid() bool {
 	return p.Settlement >= 0 && p.MaxIncomingBlocks > 0 &&
-		p.MaxIncomingBlocks <= MaxBlocks
+		p.MaxIncomingBlocks <= MaxBlocks &&
+		p.HoldExpiryDelta < p.MaxIncomingBlocks
+}
+
+// Usable returns the blocks of an incoming HTLC that count as margin: those
+// before the incoming node gives up on the held invoice. ok is false when
+// there are none.
+func (p Policy) Usable(remaining uint32) (blocks uint32, ok bool) {
+	if remaining <= p.HoldExpiryDelta {
+		return 0, false
+	}
+
+	return remaining - p.HoldExpiryDelta, true
 }
 
 // span multiplies a block count by a per-block duration without overflowing.
@@ -184,7 +209,9 @@ func RequiredIncomingBlocks(in Bounds, out Leg, p Policy) (uint32, error) {
 	// extra block to become strictly greater, and an inexact one has its
 	// remainder covered by the same block. TestRequiredIsMinimal pins this
 	// against Check so the two cannot drift apart.
-	blocks := int64(exposure/in.Fast) + 1
+	// The incoming node gives up on the held invoice HoldExpiryDelta
+	// blocks before the HTLC expires, so those are asked for on top.
+	blocks := int64(exposure/in.Fast) + 1 + int64(p.HoldExpiryDelta)
 
 	if blocks > int64(p.MaxIncomingBlocks) {
 		return 0, fmt.Errorf("%w: need %d blocks, limit %d", ErrTooLong,

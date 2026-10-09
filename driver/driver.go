@@ -144,10 +144,15 @@ func (d *Driver) Gate(ctx context.Context, sw *Swap, r Rates) (swap.Event, error
 		// Already expired, or expiring in this block.
 		return swap.MarginRefused, nil
 	}
-	remaining := inv.ExpiryHeight - height
+	// The incoming node cancels the held invoice HoldExpiryDelta blocks
+	// before the HTLC expires; only the blocks before that are margin.
+	usable, ok := d.Policy.Usable(uint32(inv.ExpiryHeight - height))
+	if !ok {
+		return swap.MarginRefused, nil
+	}
 
 	err = margin.Check(
-		margin.Leg{Bounds: r.Incoming, Blocks: uint32(remaining)},
+		margin.Leg{Bounds: r.Incoming, Blocks: usable},
 		margin.Leg{Bounds: r.Outgoing, Blocks: sw.OutgoingCLTVLimit},
 		d.Policy,
 	)

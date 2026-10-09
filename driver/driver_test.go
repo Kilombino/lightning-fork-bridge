@@ -691,3 +691,63 @@ func TestPayReportsAPaymentThatNeverLeft(t *testing.T) {
 		t.Fatalf("event %v (%v), want %v", event, ok, swap.OutgoingNotSent)
 	}
 }
+
+// TestGateDoesNotCountTheHoldExpiryDelta: the incoming node gives up on the
+// held invoice HoldExpiryDelta blocks before the HTLC expires, so an HTLC
+// that has just enough blocks to the expiry, but not once those are taken
+// off, is refused. Counting them let a payee hold the payout until the
+// incoming claim was cancelled, and the payer kept both sides.
+func TestGateDoesNotCountTheHoldExpiryDelta(t *testing.T) {
+	withDelta := pol
+	withDelta.HoldExpiryDelta = margin.DefaultHoldExpiryDelta
+
+	required, err := margin.RequiredIncomingBlocks(blake, margin.Leg{
+		Bounds: btc, Blocks: funded().OutgoingCLTVLimit,
+	}, pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		left int32
+		want swap.Event
+	}{
+		// Enough without the delta, not with it.
+		{left: int32(required), want: swap.MarginRefused},
+		{left: int32(required) + margin.DefaultHoldExpiryDelta - 1,
+			want: swap.MarginRefused},
+		// Enough with it.
+		{left: int32(required) + margin.DefaultHoldExpiryDelta,
+			want: swap.MarginPassed},
+	} {
+		in := &fakeIn{
+			invoice: node.Invoice{
+				State:        node.InvoiceAccepted,
+				ExpiryHeight: 1000 + tc.left,
+			},
+			height: 1000,
+		}
+		d := &Driver{In: in, Out: &fakeOut{}, Policy: withDelta, Now: fixedNow}
+
+		ev, err := d.Gate(context.Background(), funded(), rates)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ev != tc.want {
+			t.Errorf("%d blocks left: got %v, want %v", tc.left, ev,
+				tc.want)
+		}
+	}
+
+	// And the quote asks the payer for exactly that much more.
+	withRequired, err := margin.RequiredIncomingBlocks(blake, margin.Leg{
+		Bounds: btc, Blocks: funded().OutgoingCLTVLimit,
+	}, withDelta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withRequired != required+margin.DefaultHoldExpiryDelta {
+		t.Errorf("required %d with the delta, want %d", withRequired,
+			required+margin.DefaultHoldExpiryDelta)
+	}
+}
