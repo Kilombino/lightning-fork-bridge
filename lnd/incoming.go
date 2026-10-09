@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -92,7 +93,7 @@ func (i *Incoming) LookupInvoice(ctx context.Context, hash node.Hash) (
 		},
 	})
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
+		if invoiceAbsent(err) {
 			return node.Invoice{}, fmt.Errorf("%w: %x", node.ErrUnknownHash,
 				hash)
 		}
@@ -271,4 +272,13 @@ func blockHeight(ctx context.Context, c lnrpc.LightningClient) (int32, error) {
 	}
 
 	return int32(h), nil
+}
+
+// invoiceAbsent reports whether a lookup failed because the node has no such
+// invoice. lnd answers NotFound for that, except on a node that has never
+// made an invoice at all, which answers "there are no existing invoices" with
+// no code; a new SHA256 node is one, until its first swap.
+func invoiceAbsent(err error) bool {
+	return status.Code(err) == codes.NotFound ||
+		strings.Contains(err.Error(), "there are no existing invoices")
 }

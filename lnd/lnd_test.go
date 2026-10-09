@@ -315,6 +315,15 @@ func TestUnknownHashIsItsOwnAnswer(t *testing.T) {
 		t.Errorf("want ErrUnknownHash, got %v", err)
 	}
 
+	// A node that has never made an invoice answers this instead, with no
+	// code: a new SHA256 node, before its first swap.
+	f.invoiceErr = status.Error(codes.Unknown, "there are no existing invoices")
+	if _, err := in.LookupInvoice(ctx, node.Hash{1}); !errors.Is(err,
+		node.ErrUnknownHash) {
+
+		t.Errorf("no invoices yet: want ErrUnknownHash, got %v", err)
+	}
+
 	// Anything else is a real error and must not be flattened into it, or a
 	// node that is merely unreachable would read as one that never had the
 	// invoice.
